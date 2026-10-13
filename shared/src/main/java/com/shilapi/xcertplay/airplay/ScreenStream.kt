@@ -61,6 +61,11 @@ class ScreenStream(private val key: ByteArray, private val onDiagnostic: (String
         try {
             val accepted = bound.accept()
             socket = accepted
+            // The video stream is latency-sensitive bulk TCP: disable Nagle on our end and give
+            // the receive window room to absorb Wi-Fi bursts so a stalled frame does not back up
+            // the iPhone's send buffer (which drives its rate adaptation down).
+            runCatching { accepted.tcpNoDelay = true }
+            runCatching { accepted.receiveBufferSize = 512 * 1024 }
             run(accepted)
         } catch (error: Exception) {
             if (!closed.get()) listener.onClosed(error)
@@ -72,9 +77,10 @@ class ScreenStream(private val key: ByteArray, private val onDiagnostic: (String
         val stats = StreamReceiveStats("video", onDiagnostic)
         try {
             val input = sock.getInputStream()
+            val header = ByteArray(HEADER_LEN)
             while (!closed.get()) {
                 stats.reading()
-                val header = readFully(input, HEADER_LEN) ?: break
+                if (!readFully(input, header, HEADER_LEN)) break
                 val bodySize = readU32Le(header, 0)
                 if (bodySize > MAX_BODY) break
                 val body = readFully(input, bodySize) ?: break
@@ -134,6 +140,17 @@ class ScreenStream(private val key: ByteArray, private val onDiagnostic: (String
             offset += read
         }
         return output
+    }
+
+    /** Reads exactly [length] bytes into [output]; returns false when the stream ends. */
+    private fun readFully(input: InputStream, output: ByteArray, length: Int): Boolean {
+        var offset = 0
+        while (offset < length) {
+            val read = input.read(output, offset, length - offset)
+            if (read < 0) return false
+            offset += read
+        }
+        return true
     }
 
     private companion object {

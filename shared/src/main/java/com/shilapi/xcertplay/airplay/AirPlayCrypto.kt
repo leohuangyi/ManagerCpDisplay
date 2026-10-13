@@ -55,6 +55,12 @@ object AirPlayCrypto {
     val chachaImplementation: String
         get() = platformState.get()?.implementation ?: "BouncyCastle"
 
+    // A per-thread BouncyCastle cipher avoids rebuilding the cipher for every video frame;
+    // on the receive thread that is the biggest remaining per-frame allocation.
+    private val bouncyOpenState = object : ThreadLocal<ChaCha20Poly1305?>() {
+        override fun initialValue(): ChaCha20Poly1305? = null
+    }
+
     data class X25519KeyPair(val privateKey: ByteArray, val publicKey: ByteArray)
     data class Ed25519KeyPair(val privateKey: ByteArray, val publicKey: ByteArray)
 
@@ -191,7 +197,7 @@ object AirPlayCrypto {
         ciphertextAndTag: ByteArray,
         aad: ByteArray = ByteArray(0),
     ): ByteArray {
-        val cipher = ChaCha20Poly1305()
+        val cipher = bouncyOpenState.get() ?: ChaCha20Poly1305().also { bouncyOpenState.set(it) }
         cipher.init(false, AEADParameters(KeyParameter(key), MAC_BITS, nonce, aad))
         val output = ByteArray(cipher.getOutputSize(ciphertextAndTag.size))
         val processed = cipher.processBytes(ciphertextAndTag, 0, ciphertextAndTag.size, output, 0)

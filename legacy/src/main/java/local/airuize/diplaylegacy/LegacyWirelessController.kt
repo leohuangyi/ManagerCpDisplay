@@ -170,7 +170,7 @@ class LegacyWirelessController(
             main = AirPlayDisplayConfig(
                 widthPixels = displayWidth,
                 heightPixels = displayHeight,
-                fps = 30,
+                fps = 60,
                 primaryInputDevice = 1,
             ),
             cluster = null,

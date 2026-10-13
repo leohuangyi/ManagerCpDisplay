@@ -44,6 +44,8 @@ object LegacyWirelessHost {
             videoWidth = videoWidth,
             videoHeight = videoHeight,
             context = appContext,
+            // No-op on non-MTK codecs; on MTK it drops decode-to-display latency and display reorder.
+            mtkDecoderTuningEnabled = true,
         )
         // CarPlay's main screen stream is type 110 (CarPlayMediaEngine.STREAM_TYPE_MAIN_SCREEN,
         // the only screen in the legacy config): once it is active the host screen can drop its
