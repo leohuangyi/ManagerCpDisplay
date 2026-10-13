@@ -49,6 +49,7 @@ class LegacyNetwork(
     fun prepare(): Endpoint = when (networkMode) {
         "direct" -> prepareDirect()
         "router" -> prepareRouter()
+        "reuse" -> prepareReuse()
         else -> prepareSoftAp()
     }
 
@@ -134,6 +135,16 @@ class LegacyNetwork(
             ?: throw IllegalStateException("Network IPv4 address unavailable")
         log("Network mode=$networkMode interface=${iface.name} ready=true")
         return Endpoint(ssid, password, channel = 0, iface, address)
+    }
+
+    // --- Reuse an already-running hotspot (manual hostapd/dnsmasq) -------------------------
+    // The miwifi firmware's setWifiApEnabled does not start hostapd, so the hotspot is brought
+    // up manually (root) and this mode only discovers the endpoint without touching Wi-Fi.
+    private fun prepareReuse(): Endpoint {
+        val (iface, address) = findEndpoint(listOf("wlan", "ap"))
+            ?: throw IllegalStateException("Network IPv4 address unavailable")
+        log("Network mode=$networkMode interface=${iface.name} ready=true")
+        return Endpoint("DiPlay-Legacy", "diplay1234", channel = 6, iface, address)
     }
 
     // --- Hotspot via setWifiApEnabled reflection (app / saved) -----------------------------

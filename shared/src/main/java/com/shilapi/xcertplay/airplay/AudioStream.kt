@@ -190,7 +190,7 @@ class AudioStream(
     private fun bindAnyPort(): DatagramSocket {
         val socket = DatagramSocket(null)
         socket.reuseAddress = true
-        socket.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+        socket.bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), 0))
         return socket
     }
 

@@ -1446,7 +1446,7 @@ private class VideoDecoder(
             recover("video decoder input stalled")
             return
         }
-        val input = checkNotNull(codec.getInputBuffer(index)) { "Decoder input buffer unavailable" }
+        val input = checkNotNull(codec.decoderInputBuffer(index)) { "Decoder input buffer unavailable" }
         input.clear()
         if (annexB.size <= input.remaining()) {
             input.put(annexB)
@@ -1538,7 +1538,7 @@ private class VideoDecoder(
                     localNs + delay.nanos
                 } else 0L
                 if (targetNs - now in 1..MAX_PACING_AHEAD_NS) {
-                    codec.releaseOutputBuffer(index, targetNs)
+                    codec.releaseOutputCompatible(index, render, targetNs)
                 } else {
                     if (shown && delay != null && !heldOverGap && !pauseHeld) stats.onLate()
                     codec.releaseOutputBuffer(index, render)
@@ -2120,7 +2120,7 @@ private class AudioRenderer(
             }
             return
         }
-        val input = codec.getInputBuffer(index) ?: return
+        val input = codec.decoderInputBuffer(index) ?: return
         input.clear()
         if (payload.size <= input.remaining()) {
             input.put(payload)
@@ -2178,7 +2178,7 @@ private class AudioRenderer(
                     var copied = false
                     try {
                         if (size > 0) {
-                            val output = codec.getOutputBuffer(index)
+                            val output = codec.decoderOutputBuffer(index)
                             if (output != null) {
                                 if (size > pcm.size) pcm = ByteArray(size)
                                 output.position(info.offset)
@@ -2445,5 +2445,33 @@ private class AudioRenderer(
         const val STATS_TAG = "DiPlay-AudioStats"
         const val STATS_WINDOW_NS = 5_000_000_000L
         const val DECODED_BUFFER_LOG_INTERVAL = 50
+    }
+}
+
+// --- MediaCodec API 17 compatibility --------------------------------------------------
+// getInputBuffer(int)/getOutputBuffer(int)/releaseOutputBuffer(int, long) were added in API 21.
+// Android 4.2 (API 17) exposes the deprecated array getters and the render-boolean release only.
+
+private fun MediaCodec.decoderInputBuffer(index: Int): ByteBuffer? =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+        getInputBuffer(index)
+    } else {
+        @Suppress("DEPRECATION")
+        getInputBuffers().getOrNull(index)
+    }
+
+private fun MediaCodec.decoderOutputBuffer(index: Int): ByteBuffer? =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+        getOutputBuffer(index)
+    } else {
+        @Suppress("DEPRECATION")
+        getOutputBuffers().getOrNull(index)
+    }
+
+private fun MediaCodec.releaseOutputCompatible(index: Int, render: Boolean, timedNs: Long = 0L) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && timedNs > 0) {
+        releaseOutputBuffer(index, timedNs)
+    } else {
+        releaseOutputBuffer(index, render)
     }
 }

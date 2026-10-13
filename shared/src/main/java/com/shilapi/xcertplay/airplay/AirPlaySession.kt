@@ -789,7 +789,7 @@ class AirPlaySession(
     private fun openKeepAlive(): Int {
         val socket = DatagramSocket(null)
         socket.reuseAddress = true
-        socket.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+        socket.bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), 0))
         keepAliveSocket = socket
         keepAliveThread = Thread({ runKeepAlive(socket) }, "airplay-keepalive").apply {
             isDaemon = true
@@ -810,7 +810,7 @@ class AirPlaySession(
     }
 
     private fun openEvent(): Int {
-        val server = ServerSocket(0, 50, InetAddress.getByName("::"))
+        val server = ServerSocket(0, 50, InetAddress.getByName("0.0.0.0"))
         eventServer = server
         spawnEvent("airplay-event-accept") { acceptEvent(server) }
         return server.localPort
@@ -987,9 +987,16 @@ internal fun teardownStreamTypes(body: Any?): List<Int>? {
     return entries.filterNot { (type, streamId) -> type == 130 && streamId != null && streamId != 1L }.map { it.first }
 }
 
-internal fun safeClose(closeable: Closeable?) {
+internal fun safeClose(closeable: Any?) {
     try {
-        closeable?.close()
+        when (closeable) {
+            // java.net.Socket/ServerSocket/DatagramSocket do not implement Closeable on API 17's
+            // Java 6 runtime, so they are handled before the Closeable branch.
+            is Socket -> closeable.close()
+            is ServerSocket -> closeable.close()
+            is DatagramSocket -> closeable.close()
+            is Closeable -> closeable.close()
+        }
     } catch (_: Exception) {
         // Best-effort close.
     }

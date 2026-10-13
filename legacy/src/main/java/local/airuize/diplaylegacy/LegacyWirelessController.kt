@@ -2,6 +2,8 @@ package local.airuize.diplaylegacy
 
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothHeadset
+import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.net.wifi.WifiManager
@@ -38,6 +40,8 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.jmdns.JmDNS
 import javax.jmdns.ServiceEvent
@@ -266,8 +270,55 @@ class LegacyWirelessController(
         )
 
         log("listening on ${endpoint.iface.name}; starting Bluetooth handshake")
+        disconnectHfp(phone)
         runBluetoothBootstrap(phone, mfiClient, identification, wirelessEndpoint)
         log("Bluetooth bootstrap ended; waiting for Wi-Fi session")
+    }
+
+    /**
+     * Disconnects the OEM Hands-Free Profile from the iPhone before opening the CarPlay RFCOMM
+     * channel. The head unit's HFP profile holds its own RFCOMM connection, so BlueZ rejects a
+     * second RFCOMM connect with EBUSY. Uses the public BluetoothHeadset API, no root required.
+     */
+    private fun disconnectHfp(phone: BluetoothDevice) {
+        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return
+        val latch = CountDownLatch(1)
+        var headset: BluetoothHeadset? = null
+        val listener = object : BluetoothProfile.ServiceListener {
+            override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+                if (profile == BluetoothProfile.HEADSET) headset = proxy as BluetoothHeadset
+                latch.countDown()
+            }
+
+            override fun onServiceDisconnected(profile: Int) {
+                latch.countDown()
+            }
+        }
+        try {
+            if (!adapter.getProfileProxy(context, listener, BluetoothProfile.HEADSET)) {
+                log("HFP proxy request rejected; skipping HFP disconnect")
+                return
+            }
+            if (!latch.await(3, TimeUnit.SECONDS) || headset == null) {
+                log("HFP proxy unavailable; skipping HFP disconnect")
+                return
+            }
+            val connected = headset!!.connectedDevices
+            if (connected.contains(phone)) {
+                log("Disconnecting HFP from iPhone")
+                // BluetoothHeadset.disconnect(BluetoothDevice) is @hide, so invoke it reflectively.
+                BluetoothHeadset::class.java.getMethod("disconnect", BluetoothDevice::class.java)
+                    .invoke(headset, phone)
+                Thread.sleep(800)
+                log("HFP disconnect requested")
+            } else {
+                log("HFP not connected to iPhone; nothing to disconnect")
+            }
+        } catch (error: Throwable) {
+            log("HFP disconnect failed: ${error.javaClass.simpleName}: ${error.message}")
+        } finally {
+            headset?.let { runCatching { adapter.closeProfileProxy(BluetoothProfile.HEADSET, it) } }
+        }
     }
 
     private fun runAirPlayServer(
