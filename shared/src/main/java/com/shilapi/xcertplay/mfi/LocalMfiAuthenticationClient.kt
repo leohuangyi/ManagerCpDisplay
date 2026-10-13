@@ -1,5 +1,7 @@
 package com.shilapi.xcertplay.mfi
 
+import android.content.Context
+import android.os.Build
 import org.bouncycastle.asn1.ASN1Integer
 import org.bouncycastle.asn1.ASN1Sequence
 import java.io.File
@@ -44,6 +46,12 @@ class LocalMfiAuthenticationClient private constructor(
         /** Private app directory loaded only when local authentication is selected. */
         const val DIRECTORY = "offline-mfi"
         private const val MAX_FILE_BYTES = 16 * 1024
+
+        /** Where the offline identity lives; [Context.getNoBackupFilesDir] is API 21+, use filesDir before. */
+        fun offlineDirectory(context: Context): File = File(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) context.noBackupFilesDir else context.filesDir,
+            DIRECTORY,
+        )
 
         fun load(directory: File, onSignature: (Int) -> Unit = {}): LocalMfiAuthenticationClient {
             require(directory.isDirectory) { "Offline MFi directory is missing or invalid" }

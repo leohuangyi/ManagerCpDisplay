@@ -5,7 +5,6 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothA2dp
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothHeadset
-import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothSocket
 import android.content.ComponentName
@@ -185,10 +184,8 @@ class CarPlayController(
     private val appContext = context.applicationContext
     private val diagnosticAttempt = diagnosticAttempts.incrementAndGet()
     private val diagnosticRun = AtomicInteger()
-    private val usbManager: UsbManager? = context.getSystemService(UsbManager::class.java)
-    private val bluetoothAdapter =
-        appContext.getSystemService(BluetoothManager::class.java)?.adapter
-            ?: BluetoothAdapter.getDefaultAdapter()
+    private val usbManager: UsbManager? = context.getSystemService(Context.USB_SERVICE) as? UsbManager
+    private val bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
     private val iphoneHost by lazy {
         IphoneUsbHost(
             appContext,
@@ -838,7 +835,7 @@ class CarPlayController(
         availabilityPollGeneration.incrementAndGet()
         phase = Phase.MFI
         onStatus(CarPlayStatus.DiscoveringMfi)
-        val offlineDirectory = java.io.File(appContext.noBackupFilesDir, LocalMfiAuthenticationClient.DIRECTORY)
+        val offlineDirectory = LocalMfiAuthenticationClient.offlineDirectory(appContext)
         when (config.mfiTarget) {
             MfiTarget.LOCAL -> openLocalMfi(offlineDirectory)
             MfiTarget.USB_CH341 -> {
@@ -2585,9 +2582,9 @@ class CarPlayController(
     private fun isBluetoothDeviceConnected(device: BluetoothDevice): Boolean = try {
         val method = BluetoothDevice::class.java.getMethod("isConnected")
         method.invoke(device) as? Boolean == true
-    } catch (error: ReflectiveOperationException) {
-        false
-    } catch (error: RuntimeException) {
+    } catch (error: Exception) {
+        // ReflectiveOperationException is API 19 and cannot be named here: Dalvik (API 17) rejects
+        // the whole class when a catch type is missing, so swallow the broader superclass instead.
         Log.w(IphoneCarPlayConfiguration.TAG, "Could not read Bluetooth connection state", error)
         false
     }

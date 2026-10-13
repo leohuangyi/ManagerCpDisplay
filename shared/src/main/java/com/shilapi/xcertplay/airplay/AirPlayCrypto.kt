@@ -16,7 +16,7 @@ import org.bouncycastle.crypto.signers.Ed25519Signer
 import java.nio.ByteBuffer
 import java.security.GeneralSecurityException
 import java.security.SecureRandom
-import javax.crypto.AEADBadTagException
+import javax.crypto.BadPaddingException
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -155,7 +155,9 @@ object AirPlayCrypto {
             val written = cipher.doFinal(source, target)
             target.flip()
             ByteArray(written).also { target.get(it); state.implementation = cipher.provider.name }
-        } catch (failure: AEADBadTagException) {
+        } catch (failure: BadPaddingException) {
+            // AEADBadTagException extends BadPaddingException, but the former is API 19+; catching
+            // the base type keeps a genuine bad tag an error while staying loadable on API 17.
             throw failure
         } catch (_: GeneralSecurityException) {
             null

@@ -6,17 +6,19 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        minSdk = 25
+        minSdk = 17
         consumerProguardFiles 'ambient-consumer-rules.pro'
-        targetSdk = 37
+        targetSdk = 18
 
         ndk {
-            abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64'
+            abiFilters 'armeabi-v7a'
         }
 
         externalNativeBuild {
             ndkBuild {
-                arguments 'APP_PLATFORM=android-25'
+                // NDK r28 drops pre-21 sysroots; speexdsp is pure C DSP, so a 21 platform
+                // still links no Android API and the .so loads on API 17.
+                arguments 'APP_PLATFORM=android-21'
             }
         }
 
@@ -38,7 +40,7 @@ android {
     }
 }
 dependencies {
-    implementation libs.androidx.app
+    implementation 'androidx.annotation:annotation:1.9.1'
     implementation libs.bouncycastle
     implementation libs.jmdns
     testImplementation libs.junit

@@ -6,6 +6,7 @@ import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.AudioEffect
 import android.media.audiofx.NoiseSuppressor
+import android.os.Build
 import android.util.Log
 import com.shilapi.xcertplay.airplay.AudioCodecKind
 import com.shilapi.xcertplay.airplay.MicrophoneConfig
@@ -17,7 +18,7 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.util.concurrent.atomic.AtomicBoolean
-import com.shilapi.xcertplay.telecom.PhoneAudioRoute
+import com.shilapi.xcertplay.compat.PhoneAudioRouteCompat
 
 /**
  * Captures one PCM microphone stream and sends it back to the phone as sealed CarPlay RTP.
@@ -162,17 +163,7 @@ internal class MicrophoneUplink(
 
     private fun createRecorder(source: Int, channelMask: Int, bufferSize: Int): AudioRecord? {
         val recorder = try {
-            AudioRecord.Builder()
-                .setAudioSource(source)
-                .setAudioFormat(
-                    AndroidAudioFormat.Builder()
-                        .setEncoding(AndroidAudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(config.sampleRate)
-                        .setChannelMask(channelMask)
-                        .build(),
-                )
-                .setBufferSizeInBytes(bufferSize)
-                .build()
+            AudioRecorderFactory.create(source, config.sampleRate, channelMask, AndroidAudioFormat.ENCODING_PCM_16BIT, bufferSize)
         } catch (error: Exception) {
             Log.e(TAG, "microphone recorder creation failed source=$source", error)
             stats.failure(MicrophoneFailureStage.RECORDER_CREATION, error)
@@ -197,7 +188,7 @@ internal class MicrophoneUplink(
     }
 
     private fun voiceEffects(sessionId: Int): List<AudioEffect> {
-        if (PhoneAudioRoute.carPlayCallsUseCarAudio()) {
+        if (PhoneAudioRouteCompat.carPlayCallsUseCarAudio()) {
             // In the car's phone audio state its own processing handles echo and noise, and was only measured
             // with the platform effects off.
             Log.i(TAG, "microphone effects left to the car's phone audio state")
@@ -397,7 +388,15 @@ internal class MicrophoneUplink(
         }
     }
 
-    private fun routeType(recorder: AudioRecord): Int? = runCatching { recorder.routedDevice?.type }.getOrNull()
+    private fun routeType(recorder: AudioRecord): Int? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return null
+        // getRoutedDevice() (API 24) and AudioDeviceInfo.getType() (API 23) are reached reflectively so
+        // MicrophoneUplink has no typed reference to AudioDeviceInfo, which Dalvik (API 17) cannot resolve.
+        return runCatching {
+            val device = AudioRecord::class.java.getMethod("getRoutedDevice").invoke(recorder) ?: return@runCatching null
+            device.javaClass.getMethod("getType").invoke(device) as? Int
+        }.getOrNull()
+    }
 
     /** Capture can continue with the same recorder if the optional native processor stops working. */
     @Synchronized
@@ -488,6 +487,29 @@ internal class MicrophoneUplink(
         const val MAX_READ_RESTARTS = 3
         const val READ_RESTART_PAUSE_MILLIS = 50L
     }
+}
+
+/**
+ * Swappable seam behind [MicrophoneUplink] recorder creation. Production uses the legacy
+ * [AudioRecord] constructor, the only one safe on API 17 Dalvik; tests replace [create] to inject
+ * source rejection without ever referencing the API 23+ [AudioRecord.Builder].
+ */
+internal object AudioRecorderFactory {
+    var create: (source: Int, sampleRate: Int, channelMask: Int, encoding: Int, bufferSize: Int) -> AudioRecord =
+        ::createLegacy
+
+    /** Restore production creation after a test swapped [create]. */
+    fun reset() {
+        create = ::createLegacy
+    }
+
+    private fun createLegacy(
+        source: Int,
+        sampleRate: Int,
+        channelMask: Int,
+        encoding: Int,
+        bufferSize: Int,
+    ): AudioRecord = AudioRecord(source, sampleRate, channelMask, encoding, bufferSize)
 }
 
 /**

@@ -167,7 +167,7 @@ object CarHotspotTethering {
                     })
                 }
             } catch (error: Exception) {
-                val adbRecovered = ((error is ReflectiveOperationException && error !is InvocationTargetException) ||
+                val adbRecovered = ((error is NoSuchMethodException || error is IllegalAccessException) ||
                     error is SecurityException ||
                     (error is InvocationTargetException && error.targetException is SecurityException)) &&
                     fallback()
@@ -175,7 +175,7 @@ object CarHotspotTethering {
                     stopped()?.let { return it }
                     return when {
                         error is InvocationTargetException -> if (error.targetException is SecurityException) Result.PERMISSION_REQUIRED else Result.FAILED
-                        error is ReflectiveOperationException -> Result.UNSUPPORTED
+                        error is NoSuchMethodException || error is IllegalAccessException -> Result.UNSUPPORTED
                         error is SecurityException -> Result.PERMISSION_REQUIRED
                         else -> Result.FAILED
                     }

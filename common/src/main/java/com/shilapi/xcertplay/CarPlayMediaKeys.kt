@@ -7,7 +7,6 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Rect
-import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaMetadata
 import android.media.session.MediaSession
@@ -288,10 +287,7 @@ internal object CarPlayMediaKeys {
             val audio = context.getSystemService(AudioManager::class.java)
             val request = AudioFocusRequestCompat(
                 AudioManager.AUDIOFOCUS_GAIN,
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build(),
+                AudioManager.STREAM_MUSIC,
                 { change -> onFocusChanged(expectedController, owner, change) },
                 mainHandler,
             )

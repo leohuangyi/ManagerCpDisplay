@@ -211,7 +211,7 @@ class LocalOnlyHotspotManager(context: Context, private val onDiagnostic: (Strin
                 WifiManager::class.java.getMethod(method, SoftApConfiguration::class.java, Executor::class.java,
                     WifiManager.LocalOnlyHotspotCallback::class.java).invoke(wifiManager, builder.build(), executor, callback)
                 return preferredChannel
-            } catch (failure: ReflectiveOperationException) {
+            } catch (failure: Exception) {
                 if (failure.cause != null && failure.cause !is SecurityException && failure.cause !is UnsupportedOperationException) {
                     throw IOException("LocalOnlyHotspot custom startup failed", failure.cause)
                 }
@@ -485,7 +485,7 @@ class LocalOnlyHotspotManager(context: Context, private val onDiagnostic: (Strin
                 "SoftApConfiguration.getChannel",
                 allowAuto = true,
             )
-        } catch (failure: ReflectiveOperationException) {
+        } catch (failure: Exception) {
             throw IOException(
                 "Android ${Build.VERSION.RELEASE} does not expose SoftApConfiguration.getChannel",
                 failure,
@@ -497,7 +497,7 @@ class LocalOnlyHotspotManager(context: Context, private val onDiagnostic: (Strin
     private fun readWifiConfigurationChannel(configuration: WifiConfiguration): Int {
         val channel = try {
             WifiConfiguration::class.java.getField("apChannel").getInt(configuration)
-        } catch (failure: ReflectiveOperationException) {
+        } catch (failure: Exception) {
             throw IOException(
                 "Android ${Build.VERSION.RELEASE} does not expose WifiConfiguration.apChannel",
                 failure,
@@ -515,7 +515,7 @@ class LocalOnlyHotspotManager(context: Context, private val onDiagnostic: (Strin
         val band = try {
             (WifiConfiguration::class.java.getField("apBand").get(configuration) as? Number)
                 ?.toInt()
-        } catch (_: ReflectiveOperationException) {
+        } catch (_: Exception) {
             null
         }
         return when (band) {
@@ -533,7 +533,7 @@ class LocalOnlyHotspotManager(context: Context, private val onDiagnostic: (Strin
         val band = try {
             (SoftApConfiguration::class.java.getMethod("getBand").invoke(configuration) as? Number)
                 ?.toInt()
-        } catch (_: ReflectiveOperationException) {
+        } catch (_: Exception) {
             null
         }
         return band?.let(::softApBandLabel) ?: legacyBandLabel(channel)

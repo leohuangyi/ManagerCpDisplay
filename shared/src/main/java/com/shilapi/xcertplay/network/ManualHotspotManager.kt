@@ -304,12 +304,12 @@ class ManualHotspotManager(
             val ssid = unquote(configuration.SSID) ?: return null
             val channel = try {
                 WifiConfiguration::class.java.getField("apChannel").getInt(configuration)
-            } catch (_: ReflectiveOperationException) {
+            } catch (_: Exception) {
                 0
             }
             val band = try {
                 legacyHotspotBandToSoftApBand(WifiConfiguration::class.java.getField("apBand").getInt(configuration))
-            } catch (_: ReflectiveOperationException) {
+            } catch (_: Exception) {
                 null
             }
             ManualApConfiguration(
