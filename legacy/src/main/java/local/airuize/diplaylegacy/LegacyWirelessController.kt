@@ -170,7 +170,9 @@ class LegacyWirelessController(
             main = AirPlayDisplayConfig(
                 widthPixels = displayWidth,
                 heightPixels = displayHeight,
-                fps = 60,
+                // 30 fps over a weak 2.4 GHz link leaves twice the bitrate budget per frame,
+                // so fast-changing scenes stay sharp instead of being crushed by iPhone rate control.
+                fps = 30,
                 primaryInputDevice = 1,
             ),
             cluster = null,

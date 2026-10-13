@@ -44,6 +44,9 @@ class ScreenStream(private val key: ByteArray, private val onDiagnostic: (String
         this.listener = listener
         val bound = ServerSocket()
         bound.reuseAddress = true
+        // Kernel receive window from the first SYN, so accepted sockets inherit 2 MB and the
+        // iPhone sees a large window during the initial burst instead of a slow-start-sized one.
+        runCatching { bound.receiveBufferSize = 2 * 1024 * 1024 }
         bound.bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), 0))
         server = bound
         thread = Thread({ accept(bound) }, "airplay-screen").apply { isDaemon = true; start() }
@@ -63,9 +66,10 @@ class ScreenStream(private val key: ByteArray, private val onDiagnostic: (String
             socket = accepted
             // The video stream is latency-sensitive bulk TCP: disable Nagle on our end and give
             // the receive window room to absorb Wi-Fi bursts so a stalled frame does not back up
-            // the iPhone's send buffer (which drives its rate adaptation down).
+            // the iPhone's send buffer (which drives its rate adaptation down). A 2 MB kernel
+            // window absorbs several seconds of bursts without adding any application latency.
             runCatching { accepted.tcpNoDelay = true }
-            runCatching { accepted.receiveBufferSize = 512 * 1024 }
+            runCatching { accepted.receiveBufferSize = 2 * 1024 * 1024 }
             run(accepted)
         } catch (error: Exception) {
             if (!closed.get()) listener.onClosed(error)
