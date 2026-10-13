@@ -51,9 +51,14 @@ object AirPlayCrypto {
                 ?.let(::PlatformChacha)
     }
 
+    // Set once a frame decrypt has gone through NativeChacha on this thread.
+    private val nativeOpenState = object : ThreadLocal<Boolean>() {
+        override fun initialValue(): Boolean = false
+    }
+
     /** Implementation used by this thread's last successful operation, for diagnostics. */
     val chachaImplementation: String
-        get() = platformState.get()?.implementation ?: "BouncyCastle"
+        get() = if (nativeOpenState.get() == true) "Native" else platformState.get()?.implementation ?: "BouncyCastle"
 
     // A per-thread BouncyCastle cipher avoids rebuilding the cipher for every video frame;
     // on the receive thread that is the biggest remaining per-frame allocation.
@@ -129,9 +134,28 @@ object AirPlayCrypto {
         ciphertextAndTag: ByteArray,
         aad: ByteArray = ByteArray(0),
     ): ByteArray = platformChacha(Cipher.DECRYPT_MODE, key, nonce, ciphertextAndTag, aad)
+        ?: nativeChachaOpen(key, nonce, ciphertextAndTag, aad)
         ?: chachaOpenBouncyCastle(key, nonce, ciphertextAndTag, aad).also {
             platformState.get()?.implementation = "BouncyCastle"
         }
+
+    /**
+     * The native C ChaCha20-Poly1305 (Apple AccessorySDK algorithm code behind NativeChacha),
+     * used below API 31 where no platform cipher exists. A missing native build falls through to
+     * BouncyCastle; a failed tag still throws, like the other paths.
+     */
+    private fun nativeChachaOpen(
+        key: ByteArray,
+        nonce: ByteArray,
+        ciphertextAndTag: ByteArray,
+        aad: ByteArray,
+    ): ByteArray? {
+        if (!NativeChacha.available) return null
+        val plaintext = NativeChacha.decryptFrame(key, nonce, aad, ciphertextAndTag)
+            ?: throw BadPaddingException("ChaCha20-Poly1305 tag mismatch")
+        nativeOpenState.set(true)
+        return plaintext
+    }
 
     /**
      * Null when the platform has no ChaCha20-Poly1305 or refuses this use of it (a desktop JDK rejects
