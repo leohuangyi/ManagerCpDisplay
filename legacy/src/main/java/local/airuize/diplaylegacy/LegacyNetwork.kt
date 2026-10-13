@@ -12,15 +12,18 @@ import java.net.NetworkInterface
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 /**
  * Brings up the wireless link for CarPlay. Mirrors the reference implementation's three modes:
  *
  *  - `direct`: Wi-Fi Direct Group Owner via [WifiP2pManager.createGroup] (needs P2P-capable firmware).
  *  - `router`: the head unit and iPhone join the same WPA2 router.
+ *  - `reuse`: discover an already-running hotspot without touching Wi-Fi.
+ *  - `auto`: start the hotspot natively over root (hostapd -> static IP -> dnsmasq), since the
+ *    miwifi firmware's `setWifiApEnabled` never launches hostapd; reuses it when already up.
  *  - `app` / `saved`: the head unit becomes a WPA2 hotspot through the hidden
- *    `WifiManager.setWifiApEnabled` reflection API. `app` auto-generates a "DiPlay-Legacy"
- *    hotspot; `saved` reuses the firmware's already-configured hotspot.
+ *    `WifiManager.setWifiApEnabled` reflection API (broken on this firmware).
  */
 class LegacyNetwork(
     private val context: Context,
@@ -45,11 +48,13 @@ class LegacyNetwork(
     private var oldApConfig: WifiConfiguration? = null
     private var apWasEnabled = false
     private var changedAp = false
+    private var hotspotStartedByUs = false
 
     fun prepare(): Endpoint = when (networkMode) {
         "direct" -> prepareDirect()
         "router" -> prepareRouter()
         "reuse" -> prepareReuse()
+        "auto" -> prepareAuto()
         else -> prepareSoftAp()
     }
 
@@ -147,6 +152,103 @@ class LegacyNetwork(
         return Endpoint("DiPlay-Legacy", "diplay1234", channel = 6, iface, address)
     }
 
+    // --- Hotspot automation (hostapd + static IP + dnsmasq through su) ---------------------
+    // The miwifi firmware ships a client-only Wi-Fi stack: services.jar has no hostapd /
+    // startSoftAp code, the OEM WifiApService only joins external hotspots and WifiApp has
+    // no tethering screen. The only working soft-AP is the native three-step sequence
+    // (hostapd -> static IP -> dnsmasq), so this mode drives it directly as root.
+    private fun prepareAuto(): Endpoint {
+        val (ssid, password, channel) = readHotspotConfig()
+
+        // Fast path: this mode's hotspot is already up, keep the connection intact.
+        // InetAddress.toString() prefixes a slash ("/192.168.43.1"), compare hostAddress.
+        val existing = scanEndpoint(listOf("wlan", "ap"))
+        if (existing != null && existing.second.hostAddress.startsWith("192.168.43.")) {
+            hotspotStartedByUs = false
+            log("Network mode=$networkMode interface=${existing.first.name} already up")
+            return Endpoint(ssid, password, channel, existing.first, existing.second)
+        }
+
+        val (idRc, idOut) = runSu(SU_ID, timeoutSeconds = 5)
+        if (idRc != 0 || !idOut.contains("uid=0")) {
+            throw IllegalStateException("Hotspot automation needs root: grant su once over USB adb")
+        }
+
+        val (upRc, upOut) = runSu(SU_HOTSPOT_UP)
+        log("Hotspot up rc=$upRc out=${upOut.trim().take(300)}")
+        check(upRc == 0) { "Hotspot startup failed rc=$upRc" }
+        hotspotStartedByUs = true
+
+        val (iface, address) = findEndpoint(listOf("wlan", "ap"))
+            ?: throw IllegalStateException("Network IPv4 address unavailable")
+        log("Network mode=$networkMode interface=${iface.name} ready=true")
+        return Endpoint(ssid, password, channel, iface, address)
+    }
+
+    /** Reads (ssid, passphrase, channel) from /data/misc/wifi/hostapd.conf, falling back to the known defaults. */
+    private fun readHotspotConfig(): Triple<String, String, Int> {
+        var ssid = "DiPlay-Legacy"
+        var password = "diplay1234"
+        var channel = 6
+        val (rc, out) = runSu("cat /data/misc/wifi/hostapd.conf", timeoutSeconds = 5)
+        if (rc == 0) {
+            for (line in out.lines()) {
+                val eq = line.indexOf('=')
+                if (eq <= 0) continue
+                val key = line.substring(0, eq).trim()
+                val value = line.substring(eq + 1).trim()
+                when (key) {
+                    "ssid" -> ssid = value
+                    "wpa_passphrase" -> password = value
+                    "channel" -> channel = value.toIntOrNull() ?: channel
+                }
+            }
+        }
+        return Triple(ssid, password, channel)
+    }
+
+    private fun runSu(script: String, timeoutSeconds: Long = 20): Pair<Int, String> {
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return -1 to (e.message ?: "su unavailable")
+        }
+        val output = StringBuilder()
+        val reader = thread(start = true, isDaemon = true) {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { output.append(it).append('\n') }
+            }
+        }
+        // Process.waitFor(long, TimeUnit) needs API 26; poll exitValue() instead for API 17.
+        val deadline = System.currentTimeMillis() + timeoutSeconds * 1000
+        var exitValue = -1
+        var finished = false
+        while (!finished) {
+            try {
+                exitValue = process.exitValue()
+                finished = true
+            } catch (_: IllegalThreadStateException) {
+                val remaining = deadline - System.currentTimeMillis()
+                if (remaining <= 0) {
+                    runCatching { process.destroy() }
+                    return -1 to "timed out"
+                }
+                try {
+                    Thread.sleep(if (remaining < 100) remaining else 100)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+            }
+        }
+        try {
+            reader.join(1000)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        return process.exitValue() to output.toString()
+    }
+
     // --- Hotspot via setWifiApEnabled reflection (app / saved) -----------------------------
 
     private fun prepareSoftAp(): Endpoint {
@@ -225,22 +327,27 @@ class LegacyNetwork(
     private fun findEndpoint(prefixes: List<String>): Pair<NetworkInterface, Inet4Address>? {
         val deadline = System.nanoTime() + 10_000_000_000L
         while (!stopped() && System.nanoTime() < deadline) {
-            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
-            val candidates = ArrayList<NetworkInterface>()
-            while (interfaces.hasMoreElements()) {
-                val iface = interfaces.nextElement()
-                if (prefixes.any { iface.name.startsWith(it) }) candidates.add(iface)
-            }
-            for (iface in candidates) {
-                val addresses = iface.inetAddresses ?: continue
-                while (addresses.hasMoreElements()) {
-                    val address = addresses.nextElement()
-                    if (address is Inet4Address && !address.isLoopbackAddress && !address.isAnyLocalAddress) {
-                        return iface to address
-                    }
+            scanEndpoint(prefixes)?.let { return it }
+            Thread.sleep(250)
+        }
+        return null
+    }
+
+    private fun scanEndpoint(prefixes: List<String>): Pair<NetworkInterface, Inet4Address>? {
+        val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
+        val candidates = ArrayList<NetworkInterface>()
+        while (interfaces.hasMoreElements()) {
+            val iface = interfaces.nextElement()
+            if (prefixes.any { iface.name.startsWith(it) }) candidates.add(iface)
+        }
+        for (iface in candidates) {
+            val addresses = iface.inetAddresses ?: continue
+            while (addresses.hasMoreElements()) {
+                val address = addresses.nextElement()
+                if (address is Inet4Address && !address.isLoopbackAddress && !address.isAnyLocalAddress) {
+                    return iface to address
                 }
             }
-            Thread.sleep(250)
         }
         return null
     }
@@ -260,6 +367,9 @@ class LegacyNetwork(
     private fun unquote(value: String): String = value.removeSurrounding("\"")
 
     override fun close() {
+        if (hotspotStartedByUs) {
+            runSu(SU_HOTSPOT_DOWN)
+        }
         val channel = p2pChannel
         val p2pManager = p2p
         if (channel != null && p2pManager != null && Looper.myLooper() != Looper.getMainLooper()) {
@@ -289,5 +399,23 @@ class LegacyNetwork(
 
     private companion object {
         const val AP_STATE_ENABLED = 13
+
+        // Verified on the device's toolbox-only shell: no awk/xargs/killall, so leftovers
+        // are stopped through the dnsmasq pid file and a /proc scan.
+        const val SU_ID = "id"
+
+        // The /proc scan must skip its own shell: with "su -c <inline script>" the sh process
+        // cmdline contains the script text (including "hostapd"), so the scan would SIGTERM
+        // itself and fail with exit 143.
+        const val SU_HOTSPOT_UP = "if [ -f /data/local/tmp/dnsmasq.pid ]; then kill \$(cat /data/local/tmp/dnsmasq.pid) 2>/dev/null; sleep 1; fi; " +
+            "for p in /proc/[0-9]*; do [ \${p#/proc/} -eq \$\$ ] && continue; c=\$(cat \$p/cmdline 2>/dev/null); case \$c in *hostapd*) kill \${p#/proc/} 2>/dev/null ;; esac; done; " +
+            "sleep 1; setprop ctl.stop mdnsd; ifconfig wlan0 down; " +
+            "/system/bin/hostapd -B /data/misc/wifi/hostapd.conf; sleep 1; " +
+            "ifconfig wlan0 192.168.43.1 netmask 255.255.255.0 up; " +
+            "dnsmasq --interface=wlan0 --bind-interfaces --dhcp-range=192.168.43.10,192.168.43.100,12h " +
+            "--dhcp-option=3,192.168.43.1 --dhcp-option=6,8.8.8.8 --no-resolv --pid-file=/data/local/tmp/dnsmasq.pid"
+
+        const val SU_HOTSPOT_DOWN = "if [ -f /data/local/tmp/dnsmasq.pid ]; then kill \$(cat /data/local/tmp/dnsmasq.pid) 2>/dev/null; fi; " +
+            "for p in /proc/[0-9]*; do [ \${p#/proc/} -eq \$\$ ] && continue; c=\$(cat \$p/cmdline 2>/dev/null); case \$c in *hostapd*) kill \${p#/proc/} 2>/dev/null ;; esac; done"
     }
 }

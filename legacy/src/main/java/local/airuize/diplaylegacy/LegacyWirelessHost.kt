@@ -49,7 +49,7 @@ object LegacyWirelessHost {
             displayHeight = videoHeight,
             log = log,
             onConnectionFailure = { reason -> log("wireless connection failure: $reason") },
-            networkMode = "reuse",
+            networkMode = "auto",
         )
         controller = next
         val phone = findPhone() ?: run {
