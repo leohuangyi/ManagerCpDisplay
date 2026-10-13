@@ -29,6 +29,10 @@ object LegacyWirelessHost {
         width: Int,
         height: Int,
         log: (String) -> Unit = { Log.i(TAG, it) },
+        /** Short user-facing progress label, called from background threads. */
+        onStatus: (String) -> Unit = {},
+        /** The CarPlay screen stream became active: the picture is arriving. */
+        onVideo: () -> Unit = {},
     ) {
         if (controller != null) return
         LegacyCarPlayHost.installMfi(context)
@@ -41,23 +45,50 @@ object LegacyWirelessHost {
             videoHeight = videoHeight,
             context = appContext,
         )
+        // CarPlay's main screen stream is type 110 (CarPlayMediaEngine.STREAM_TYPE_MAIN_SCREEN,
+        // the only screen in the legacy config): once it is active the host screen can drop its
+        // loading overlay. The sink replays already-active streams when the listener registers.
+        var videoReported = false
+        nextSink.setScreenStreamActiveChangedListener { _, active ->
+            if (active && !videoReported) {
+                videoReported = true
+                onVideo()
+            }
+        }
         sink = nextSink
         val next = LegacyWirelessController(
             context = appContext,
             sink = nextSink,
             displayWidth = videoWidth,
             displayHeight = videoHeight,
-            log = log,
-            onConnectionFailure = { reason -> log("wireless connection failure: $reason") },
+            log = { line ->
+                log(line)
+                statusFor(line)?.let(onStatus)
+            },
+            onConnectionFailure = { reason ->
+                log("wireless connection failure: $reason")
+                onStatus("Connection failed: $reason")
+            },
             networkMode = "auto",
         )
         controller = next
         val phone = findPhone() ?: run {
             log("no paired iPhone found; pair an iPhone over Bluetooth first")
+            onStatus("No paired iPhone found\nPair an iPhone over Bluetooth first")
             return
         }
         log("starting wireless CarPlay with ${phone.name ?: phone.address}")
         next.start(phone)
+    }
+
+    /** A short progress label for the milestone log lines the controller emits. */
+    private fun statusFor(line: String): String? = when {
+        "listening on" in line -> "Waiting for the iPhone to connect"
+        "Bluetooth RFCOMM connected" in line -> "iPhone connected"
+        "Wi-Fi iAP2 authenticated" in line -> "CarPlay connected; waiting for screen"
+        "AirPlay session active" in line -> "CarPlay connected; waiting for video"
+        "AirPlay session ended" in line -> "Waiting for the iPhone to reconnect"
+        else -> null
     }
 
     @JvmStatic

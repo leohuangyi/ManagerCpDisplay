@@ -7,6 +7,7 @@ import android.net.wifi.p2p.WifiP2pGroup
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Looper
 import java.io.Closeable
+import java.io.File
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.UUID
@@ -162,8 +163,10 @@ class LegacyNetwork(
 
         // Fast path: this mode's hotspot is already up, keep the connection intact.
         // InetAddress.toString() prefixes a slash ("/192.168.43.1"), compare hostAddress.
+        // The address alone is not enough: the kernel keeps the static address after
+        // `ifconfig down`, so a stopped hotspot would still match. Require live dnsmasq.
         val existing = scanEndpoint(listOf("wlan", "ap"))
-        if (existing != null && existing.second.hostAddress.startsWith("192.168.43.")) {
+        if (existing != null && existing.second.hostAddress.startsWith("192.168.43.") && isDnsmasqAlive()) {
             hotspotStartedByUs = false
             log("Network mode=$networkMode interface=${existing.first.name} already up")
             return Endpoint(ssid, password, channel, existing.first, existing.second)
@@ -352,6 +355,17 @@ class LegacyNetwork(
         return null
     }
 
+    /**
+     * True when the hotspot's dnsmasq is still alive: reads its pid file and verifies
+     * `/proc/<pid>/cmdline`. Only the fast path uses this, so a false negative just means
+     * the heavy path restarts the hotspot from scratch.
+     */
+    private fun isDnsmasqAlive(): Boolean = runCatching {
+        val pid = File("/data/local/tmp/dnsmasq.pid").readText().trim().toIntOrNull()
+            ?: return@runCatching false
+        File("/proc/$pid/cmdline").readText().contains("dnsmasq")
+    }.getOrDefault(false)
+
     private fun currentApConfig(): WifiConfiguration? = runCatching {
         wifi.javaClass.getMethod("getWifiApConfiguration").invoke(wifi) as? WifiConfiguration
     }.getOrNull()
@@ -422,7 +436,10 @@ class LegacyNetwork(
             "dnsmasq --interface=wlan0 --bind-interfaces --dhcp-range=192.168.43.10,192.168.43.100,12h " +
             "--dhcp-option=3,192.168.43.1 --dhcp-option=6,8.8.8.8 --no-resolv --pid-file=/data/local/tmp/dnsmasq.pid"
 
+        // Also drop the static address: `ifconfig down` alone keeps it in the kernel, which
+        // would make the next start's fast path see a "hotspot" without any services.
         const val SU_HOTSPOT_DOWN = SU_KILL_DNSMASQ +
-            "for p in /proc/[0-9]*; do [ \${p#/proc/} -eq \$\$ ] && continue; c=\$(cat \$p/cmdline 2>/dev/null); case \$c in *hostapd*) kill \${p#/proc/} 2>/dev/null ;; esac; done"
+            "for p in /proc/[0-9]*; do [ \${p#/proc/} -eq \$\$ ] && continue; c=\$(cat \$p/cmdline 2>/dev/null); case \$c in *hostapd*) kill \${p#/proc/} 2>/dev/null ;; esac; done; " +
+            "ifconfig wlan0 0.0.0.0"
     }
 }
