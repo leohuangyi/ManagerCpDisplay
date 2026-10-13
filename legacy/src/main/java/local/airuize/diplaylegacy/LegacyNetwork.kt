@@ -400,14 +400,21 @@ class LegacyNetwork(
     private companion object {
         const val AP_STATE_ENABLED = 13
 
-        // Verified on the device's toolbox-only shell: no awk/xargs/killall, so leftovers
-        // are stopped through the dnsmasq pid file and a /proc scan.
         const val SU_ID = "id"
+
+        // Verified on the device's toolbox-only shell: no awk/xargs/killall, so leftovers
+        // are stopped through a validated dnsmasq pid file and a /proc scan for hostapd.
+        // The dnsmasq kill checks /proc/<pid>/cmdline first: the pid file may be stale (PID
+        // recycled to an unrelated process) or polluted by a shell user, and a blind kill
+        // could SIGTERM an innocent process. It must never touch its own shell either.
+        const val SU_KILL_DNSMASQ = "p=\$(cat /data/local/tmp/dnsmasq.pid 2>/dev/null); " +
+            "if [ -n \"\$p\" ] && [ \"\$p\" != \"\$\$\" ]; then c=\$(cat /proc/\$p/cmdline 2>/dev/null); " +
+            "case \$c in *dnsmasq*) kill \$p 2>/dev/null; sleep 1 ;; esac; fi; "
 
         // The /proc scan must skip its own shell: with "su -c <inline script>" the sh process
         // cmdline contains the script text (including "hostapd"), so the scan would SIGTERM
         // itself and fail with exit 143.
-        const val SU_HOTSPOT_UP = "if [ -f /data/local/tmp/dnsmasq.pid ]; then kill \$(cat /data/local/tmp/dnsmasq.pid) 2>/dev/null; sleep 1; fi; " +
+        const val SU_HOTSPOT_UP = SU_KILL_DNSMASQ +
             "for p in /proc/[0-9]*; do [ \${p#/proc/} -eq \$\$ ] && continue; c=\$(cat \$p/cmdline 2>/dev/null); case \$c in *hostapd*) kill \${p#/proc/} 2>/dev/null ;; esac; done; " +
             "sleep 1; setprop ctl.stop mdnsd; ifconfig wlan0 down; " +
             "/system/bin/hostapd -B /data/misc/wifi/hostapd.conf; sleep 1; " +
@@ -415,7 +422,7 @@ class LegacyNetwork(
             "dnsmasq --interface=wlan0 --bind-interfaces --dhcp-range=192.168.43.10,192.168.43.100,12h " +
             "--dhcp-option=3,192.168.43.1 --dhcp-option=6,8.8.8.8 --no-resolv --pid-file=/data/local/tmp/dnsmasq.pid"
 
-        const val SU_HOTSPOT_DOWN = "if [ -f /data/local/tmp/dnsmasq.pid ]; then kill \$(cat /data/local/tmp/dnsmasq.pid) 2>/dev/null; fi; " +
+        const val SU_HOTSPOT_DOWN = SU_KILL_DNSMASQ +
             "for p in /proc/[0-9]*; do [ \${p#/proc/} -eq \$\$ ] && continue; c=\$(cat \$p/cmdline 2>/dev/null); case \$c in *hostapd*) kill \${p#/proc/} 2>/dev/null ;; esac; done"
     }
 }
