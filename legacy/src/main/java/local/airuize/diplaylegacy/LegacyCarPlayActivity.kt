@@ -136,6 +136,23 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
         super.onDestroy()
     }
 
+    override fun onPause() {
+        // The surface is torn down right after this: release the CarPlay video streams the
+        // same way a TEARDOWN does, so the iPhone stops pushing frames into a decoder whose
+        // surface is about to disappear. The control session stays alive.
+        if (started) LegacyWirelessHost.suspendVideo()
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Back from the background: rebind the live session to the surface so the iPhone's
+        // re-established video stream renders again. A recreated surface attaches through
+        // surfaceCreated (boundSurface is then already replaced); this covers a resume where
+        // Android kept the surface alive.
+        if (started) boundSurface?.let { LegacyWirelessHost.attachSurface(it) }
+    }
+
     // -- ui --------------------------------------------------------------------------
 
     private fun buildUi(): FrameLayout {
@@ -655,6 +672,8 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
         // returns, or a recreated one stays black. The main decoder is released and the next
         // frames start a fresh one on the recreated surface.
         val confirmed = LegacyWirelessHost.detachSurface(holder.surface)
+        // The old surface is gone: onResume must not rebind it (surfaceCreated replaces it).
+        boundSurface = null
         Log.i(TAG, "surface destroyed; detach confirmed=$confirmed")
     }
 }

@@ -137,6 +137,30 @@ class AirPlaySession(
         }
     }
 
+    /**
+     * The host screen went offscreen (activity paused): releases the screen streams the same
+     * way a TEARDOWN does, before the iPhone keeps pushing frames into a decoder that the
+     * offscreen surface detach already released. The control session stays alive and the
+     * iPhone re-establishes the video stream on its own. True when a stream was released.
+     */
+    fun suspendScreenStreams(): Boolean {
+        if (closed.get()) return false
+        val torn: List<Int>
+        val altClosed: Boolean
+        synchronized(activeStreams) {
+            torn = activeStreams.filter {
+                it == STREAM_TYPE_MAIN_SCREEN || it == STREAM_TYPE_ALT_SCREEN
+            }.toList()
+            torn.forEach { activeStreams.remove(it) }
+            altClosed = STREAM_TYPE_ALT_SCREEN !in activeStreams
+        }
+        if (STREAM_TYPE_MAIN_SCREEN in torn) mainScreenToken = null
+        if (STREAM_TYPE_ALT_SCREEN in torn || altClosed) clearClusterContent()
+        torn.forEach { media.onTeardown(this, it) }
+        debugLog("airplay screen streams suspended types=$torn")
+        return torn.isNotEmpty()
+    }
+
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         mainScreenToken = null
@@ -684,7 +708,7 @@ class AirPlaySession(
                     val port = media.onScreen(this, type, stream)
                     debugLog("airplay screen stream type=$type dataPort=${port ?: "rejected"}")
                     if (port != null) {
-                        activeStreams.add(type)
+                        synchronized(activeStreams) { activeStreams.add(type) }
                         if (type == STREAM_TYPE_ALT_SCREEN) beginClusterContent()
                         else mainScreenToken = Any()
                         result.add(linkedMapOf("type" to type, "dataPort" to port))
@@ -698,7 +722,7 @@ class AirPlaySession(
                             "controlPort=${streamResponse?.get("controlPort") ?: "none"}",
                     )
                     if (streamResponse != null) {
-                        activeStreams.add(type)
+                        synchronized(activeStreams) { activeStreams.add(type) }
                         result.add(streamResponse)
                     }
                 }
@@ -707,7 +731,7 @@ class AirPlaySession(
                     debugLog("airplay buffered audio stream accepted=${streamResponse != null} " +
                         "dataPort=${streamResponse?.get("dataPort") ?: "none"}")
                     if (streamResponse != null) {
-                        activeStreams.add(type)
+                        synchronized(activeStreams) { activeStreams.add(type) }
                         result.add(streamResponse)
                     }
                 }
@@ -718,7 +742,7 @@ class AirPlaySession(
                             "dataPort=${streamResponse?.get("dataPort") ?: "none"}",
                     )
                     if (streamResponse != null) {
-                        activeStreams.add(type)
+                        synchronized(activeStreams) { activeStreams.add(type) }
                         result.add(streamResponse)
                     }
                 }
@@ -750,6 +774,17 @@ class AirPlaySession(
             listener.onHostUiRequested(this)
         }
         listener.onCommand(this, type, params)
+        // modesChanged has "No response keys" (Accessory Interface Specification) and the
+        // official plug-in answers an empty body: AirPlayReceiverServer._requestProcessCommand
+        // turns a NULL out-params into an empty plist dictionary. Echoing the reported params
+        // back is non-conformant and can trip the iPhone's mode arbiter, so reply empty here.
+        if (type == "modesChanged" || type == "changeModes") {
+            return RtspMessage.Response(
+                status = 200,
+                headers = mapOf("Content-Type" to PLIST_CONTENT_TYPE),
+                body = BplistCodec.encode(emptyMap<String, Any?>()),
+            )
+        }
         return RtspMessage.Response(status = 200)
     }
 
@@ -770,13 +805,18 @@ class AirPlaySession(
         // Restore wheel input before releasing media resources, which may take time to close.
         if (types == null || STREAM_TYPE_MAIN_SCREEN in types) mainScreenToken = null
         if (types == null || STREAM_TYPE_ALT_SCREEN in types) clearClusterContent()
-        if (types == null) {
-            activeStreams.toList().forEach { media.onTeardown(this, it) }
-            activeStreams.clear()
-        } else {
-            types.forEach { type -> if (activeStreams.remove(type)) media.onTeardown(this, type) }
+        val torn: List<Int>
+        val altClosed: Boolean
+        synchronized(activeStreams) {
+            torn = if (types == null) {
+                activeStreams.toList().also { activeStreams.clear() }
+            } else {
+                types.mapNotNull { type -> if (activeStreams.remove(type)) type else null }
+            }
+            altClosed = STREAM_TYPE_ALT_SCREEN !in activeStreams
         }
-        if (STREAM_TYPE_ALT_SCREEN !in activeStreams) clearClusterContent()
+        torn.forEach { media.onTeardown(this, it) }
+        if (types == null || altClosed) clearClusterContent()
         return RtspMessage.Response(status = 200)
     }
 
@@ -900,7 +940,15 @@ class AirPlaySession(
                 val parsed = RtspMessage.parseMessages(plaintext)
                 plaintext = parsed.rest
                 for (message in parsed.messages) {
-                    if (message.method.startsWith("RTSP/") || message.method.startsWith("HTTP/")) continue
+                    if (message.method.startsWith("RTSP/") || message.method.startsWith("HTTP/")) {
+                        // Replies to our own POST /command (SentResponses); the reply body carries the
+                        // command status ("status" key). Keep the evidence: it shows whether the iPhone
+                        // accepted or rejected e.g. a changeModes borrow.
+                        debugLog(
+                            "airplay event reply ${message.method} cseq=${message.headers["cseq"] ?: "-"} body=${message.body.size} bodyHex=${message.body.toHex()}",
+                        )
+                        continue
+                    }
                     debugLog(
                         "airplay event rx ${message.method} ${message.path} cseq=${message.headers["cseq"] ?: "-"} body=${message.body.size}",
                     )

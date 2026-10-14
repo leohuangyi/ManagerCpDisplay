@@ -21,12 +21,14 @@ internal class VideoStats(
     private var decodeSamples = 0
     private var late = 0
     private var pacingDelayNanos = 0L
+    private var everReceived = false
 
     @Synchronized fun onReceived(size: Int) {
         val now = nanoTime()
         val gap = now - lastArrivalNs
         if (lastArrivalNs != 0L && gap < IDLE_GAP_NS) maxArrivalGapNs = maxOf(maxArrivalGapNs, gap)
         lastArrivalNs = now
+        everReceived = true
         // Touches only change the main screen; a second stream must not consume their samples.
         val touchLatency = if (label.isEmpty()) TouchLatencyProbe.onFrame(now) else -1L
         if (touchLatency >= 0) {
@@ -66,7 +68,14 @@ internal class VideoStats(
         val elapsedNs = now - windowStartNs
         if (elapsedNs < WINDOW_NS) return null
         val seconds = elapsedNs / 1e9
-        if (received == 0 && touchSamples == 0) { windowStartNs = now; return null }
+        if (received == 0 && touchSamples == 0) {
+            windowStartNs = now
+            // A live CarPlay screen keeps sending frames on a still picture, so a silent
+            // window means the stream stalled or died; leave the breadcrumb that the
+            // foreground stall watchdog and the diagnostics both need.
+            if (everReceived) Log.i(TAG, "video stats$label rx=0fps stalled window")
+            return null
+        }
         val touchAvgMs = if (touchSamples == 0) -1 else touchLatencySumNs / touchSamples / 1_000_000
         val line = ("video stats$label rx=%.1ffps shown=%.1ffps maxGap=%dms kbps=%d recoveries=%d " +
             "touch2frame avg=%dms max=%dms n=%d touchSendMax=%dms").format(

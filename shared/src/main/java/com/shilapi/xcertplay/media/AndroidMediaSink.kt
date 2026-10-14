@@ -1055,7 +1055,10 @@ private class VideoDecoder(
         }
         // A codec can accept the rate and still fail once it runs (start errors may surface on
         // later calls): one that failed before its first frame with it is not given it again.
-        if (configuredRate > 0 && !renderedFrameLogged && error is MediaCodec.CodecException) {
+        // MediaCodec.CodecException is API 21+; resolving it on API 17 throws NoClassDefFoundError,
+        // so the type is matched by class name instead of a reference the older VM cannot load.
+        if (configuredRate > 0 && !renderedFrameLogged &&
+            error.javaClass.name == "android.media.MediaCodec\$CodecException") {
             dropOperatingRate("codec failed before its first frame")
         }
         releaseDecoder()

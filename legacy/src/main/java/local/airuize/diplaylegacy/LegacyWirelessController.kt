@@ -62,6 +62,8 @@ class LegacyWirelessController(
     private val displayHeight: Int,
     private val log: (String) -> Unit = { Log.i(TAG, it) },
     private val onConnectionFailure: (String) -> Unit = {},
+    /** An established AirPlay session ended: its control connection is gone for good. */
+    private val onSessionEnded: () -> Unit = {},
     private val onHostUi: () -> Unit = {},
     private val networkMode: String = "router",
 ) : Closeable {
@@ -70,8 +72,20 @@ class LegacyWirelessController(
         private const val TAG = "LegacyWireless"
         private const val RFCOMM_UUID = "00000000-deca-fade-deca-deafdecacafe"
         private const val SOURCE_VERSION = "950.7.1"
-        private const val RFCOMM_CONNECT_ATTEMPTS = 3
-        private const val RFCOMM_CONNECT_RETRY_DELAY_MS = 1500L
+        // The stale RFCOMM channel of a just-closed bootstrap can take several seconds to
+        // clear in this head unit's Bluetooth service, so give the connect a wide window.
+        private const val RFCOMM_CONNECT_ATTEMPTS = 5
+        private const val RFCOMM_CONNECT_RETRY_DELAY_MS = 2000L
+        /** AirPlay resource id and changeModes transfer types for the CarPlay main screen. */
+        private const val RESOURCE_ID_MAIN_SCREEN = 1
+        private const val TRANSFER_BORROW = 3
+        private const val TRANSFER_UNBORROW = 4
+        /** AirPlayTransferPriority UserInitiated: the driver's own request outranks the iPhone. */
+        private const val TRANSFER_PRIORITY_USER_INITIATED = 500
+        /** AirPlayConstraint Never: the iPhone may not end this borrow on its own. */
+        private const val CONSTRAINT_NEVER = 1000
+        /** Apple's predefined borrowID for a screen the vehicle is not showing. */
+        private const val BORROW_ID_DISPLAY_OFF = "displayOff"
     }
 
     private val closed = AtomicBoolean(false)
@@ -92,6 +106,7 @@ class LegacyWirelessController(
             sessions.remove(session)
             if (activeSession === session) activeSession = null
             log("AirPlay session ended")
+            onSessionEnded()
         }
 
         override fun onTransportError(message: String) {
@@ -106,6 +121,22 @@ class LegacyWirelessController(
         override fun onHostUiRequested(session: AirPlaySession) {
             onHostUi()
         }
+
+        override fun onCommand(session: AirPlaySession, type: String, params: Map<String, Any?>) {
+            // modesChanged (and the changeModes family) reports which side owns each resource:
+            // entity 1 = iPhone, 2 = accessory. Tracked for the logs: a borrow shows up as
+            // entity 2 and the unborrow returns it to 1.
+            if (type != "modesChanged" && type != "changeModes") return
+            val states = (params["resources"] as? List<*>).orEmpty().mapNotNull { entry ->
+                val resource = entry as? Map<*, *> ?: return@mapNotNull null
+                "res=${resource["resourceID"]}(entity=${resource["entity"]},permanent=${resource["permanentEntity"]})"
+            }
+            log("iPhone resource modes ($type): ${states.joinToString(" ") { it }}")
+            // The appStates payload explains why the iPhone re-announced modes (for example a
+            // music play/pause flipping an audio app) and is the evidence that ties a stream
+            // stall to the iPhone-side state change; it is logged rather than acted upon.
+            params["appStates"]?.let { log("iPhone app states ($type): ${it.toString().take(300)}") }
+        }
     }
 
     fun start(phone: BluetoothDevice) {
@@ -118,6 +149,69 @@ class LegacyWirelessController(
     fun sendTouch(contacts: List<AirPlayContact>): Boolean {
         val session = activeSession ?: return false
         return runCatching { session.sendTouch(contacts) }.getOrDefault(false)
+    }
+
+    /**
+     * The host activity left the foreground. The accessory borrows the CarPlay main screen
+     * (changeModes, transferType 3, borrowID "displayOff"), Apple's pattern for a screen the
+     * vehicle is about to hide: the iPhone answers by stopping the screen stream itself, and it
+     * knows the stream is down. The local suspension stays as a fallback for an iPhone that
+     * ignores the borrow. The control session survives; on resume [unborrowMainScreen] returns
+     * the resource and the iPhone re-establishes the video stream with its own retries.
+     */
+    fun pauseVideo(): Boolean {
+        val session = activeSession
+        if (session == null) {
+            // The silent path here once let a dead-session pause hide for hours: the borrow
+            // cannot go out without a session, so say so instead of returning quietly.
+            log("video pause skipped: no live AirPlay session")
+            return false
+        }
+        val taken = sendCommand(changeModes(transferType = TRANSFER_BORROW))
+        val torn = runCatching { session.suspendScreenStreams() }.getOrDefault(false)
+        if (torn) log("video suspended for the background")
+        if (taken) log("main screen borrow sent: the iPhone stops the stream itself")
+        return torn || taken
+    }
+
+    /**
+     * Returns the borrowed main screen to the iPhone (changeModes, transferType 4): CarPlay UI
+     * takes it back and re-establishes the video stream over the live control session without
+     * a full reboot. Sending the unborrow again is harmless when the stream is already back.
+     */
+    fun unborrowMainScreen(): Boolean = sendCommand(changeModes(transferType = TRANSFER_UNBORROW))
+
+    /** The changeModes command that borrows or returns the CarPlay main screen resource. */
+    private fun changeModes(transferType: Int): Map<String, Any?> {
+        val entry = linkedMapOf<String, Any?>(
+            "resourceID" to RESOURCE_ID_MAIN_SCREEN,
+            "transferType" to transferType,
+        )
+        if (transferType == TRANSFER_BORROW) {
+            entry["transferPriority"] = TRANSFER_PRIORITY_USER_INITIATED
+            // The official Borrow wire format keys this "unborrowConstraint" and rejects a borrow
+            // without a borrowID; "displayOff" is Apple's predefined id for a hidden screen.
+            entry["unborrowConstraint"] = CONSTRAINT_NEVER
+            entry["borrowID"] = BORROW_ID_DISPLAY_OFF
+        } else {
+            // Unborrow carries only the borrowID; constraint keys are rejected on it.
+            entry["borrowID"] = BORROW_ID_DISPLAY_OFF
+        }
+        return mapOf("type" to "changeModes", "params" to mapOf("resources" to listOf(entry)))
+    }
+
+    /**
+     * Asks the iPhone for a fresh key frame. Recovers a stream that still runs but renders
+     * black after the surface swap; harmless when the screen stream is already down.
+     */
+    fun requestKeyFrame(): Boolean = sendCommand(mapOf("type" to "forceKeyFrame"))
+
+    /** Sends a CarPlay control command over the live session; false with no live session. */
+    private fun sendCommand(command: Map<String, Any?>): Boolean {
+        val session = activeSession ?: return false
+        return runCatching { session.sendCommand(command) }.getOrDefault(false).also { sent ->
+            log(if (sent) "iPhone command sent: ${command["type"]}" else "iPhone command not sent: ${command["type"]}")
+        }
     }
 
     private fun bootstrap(phone: BluetoothDevice) {
@@ -339,7 +433,14 @@ class LegacyWirelessController(
             rightHandDrive = LegacySettings.rightHandDrive(context),
             port = 7100,
             hevc = LegacySettings.hevc(context),
-            disableAudioOutput = false,
+            // This head unit routes CarPlay audio over its native Bluetooth A2DP service
+            // (system_server BlueZ), not through a CarPlay audio stream. Advertising CarPlay
+            // audio output here made the iPhone negotiate mainBuffered but still send music
+            // over A2DP, and the mismatch reset the AirPlay session ~8 s after a play/pause
+            // tap. Declaring no audio output lets the iPhone use A2DP cleanly, so no CarPlay
+            // audio renderer is created to conflict with it.
+            mainBufferedAudio = false,
+            disableAudioOutput = true,
             microphone = false,
             microphoneOpus = false,
             manufacturer = "CarPlay",

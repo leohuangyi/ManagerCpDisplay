@@ -1,5 +1,7 @@
 # AGENTS.md
 
+@PROJECT_MEMORY.md
+
 Instructions for coding agents that work on DiPlay.
 
 ## Checks

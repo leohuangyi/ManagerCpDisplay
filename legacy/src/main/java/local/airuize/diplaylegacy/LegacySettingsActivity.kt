@@ -21,7 +21,7 @@ import android.widget.TextView
 /**
  * The settings screen of the legacy port, modeled after the reference project's settings
  * groups (DiPlayActivity), trimmed to what the legacy stack can actually obey: auto-connect,
- * network mode, router password, device management, frame rate, right-hand drive and HEVC.
+ * network mode, router password, device management, frame rate and right-hand drive.
  * Registered as its own launcher entry so the head unit's app list shows "CarPlay设置".
  */
 class LegacySettingsActivity : Activity() {
@@ -298,15 +298,6 @@ class LegacySettingsActivity : Activity() {
             toggleRow(c, "右手驾驶", "车辆靠左行驶时使用，重新连接后生效",
                 LegacySettings.rightHandDrive(this)) { enabled ->
                 LegacySettings.setRightHandDrive(this, enabled)
-                render()
-            }
-        }
-
-        caption("高级")
-        card { c ->
-            toggleRow(c, "高效视频（HEVC）", "默认关闭以获得最广泛的车机兼容性，重新连接后生效",
-                LegacySettings.hevc(this)) { enabled ->
-                LegacySettings.setHevc(this, enabled)
                 render()
             }
         }

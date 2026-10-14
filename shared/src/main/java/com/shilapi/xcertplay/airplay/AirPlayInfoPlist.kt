@@ -23,6 +23,8 @@ object AirPlayInfoPlist {
     private const val TRANSFER_TAKE = 1
     private const val PRIORITY_NICE_TO_HAVE = 100
     private const val CONSTRAINT_ANYTIME = 100
+    /** AirPlayEntity Controller: the iPhone is the permanent resource owner. */
+    private const val ENTITY_CONTROLLER = 1
 
     /** Discovery and /info must describe the same receiver capabilities. */
     fun features(config: AirPlayConfig): Long =
@@ -90,11 +92,23 @@ object AirPlayInfoPlist {
         "transferPriority" to PRIORITY_NICE_TO_HAVE,
         "takeConstraint" to CONSTRAINT_ANYTIME,
         "borrowConstraint" to CONSTRAINT_ANYTIME,
-        "unborrowConstraint" to CONSTRAINT_ANYTIME,
+    )
+
+    /**
+     * Declares the iPhone the permanent owner of a resource before any mode transfer, the
+     * counterpart of its own initial-modes declaration: a later borrow can hand a resource over
+     * temporarily and an unborrow returns it here.
+     */
+    private fun permanentEntity(resourceId: Int): Map<String, Any?> = linkedMapOf(
+        "resourceID" to resourceId,
+        "permanentEntity" to ENTITY_CONTROLLER,
+        "takeConstraint" to CONSTRAINT_ANYTIME,
+        "borrowConstraint" to CONSTRAINT_ANYTIME,
     )
 
     private fun modes(): Map<String, Any?> = linkedMapOf(
         "resources" to listOf(resource(RESOURCE_SCREEN), resource(RESOURCE_AUDIO)),
+        "initialPermanentEntity" to listOf(permanentEntity(RESOURCE_SCREEN), permanentEntity(RESOURCE_AUDIO)),
         "appStates" to listOf(
             linkedMapOf("appStateID" to 2, "state" to false),
             linkedMapOf("appStateID" to 1, "speechMode" to -1),
