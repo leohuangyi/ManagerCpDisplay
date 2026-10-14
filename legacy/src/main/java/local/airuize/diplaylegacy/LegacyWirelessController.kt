@@ -39,6 +39,7 @@ import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
@@ -251,7 +252,11 @@ class LegacyWirelessController(
             { closed.get() },
             { attempt -> if (attempt == 1) log("AirPlay port busy; waiting up to 5s") },
         )
-        resources += server
+        // The listener is deliberately NOT registered in "resources": the shutdown path must
+        // never close it from another thread. On this head unit a ServerSocket closed by a
+        // different thread can leave the LISTEN socket pinned in the kernel, and the next
+        // bootstrap then dies with EADDRINUSE on bind. The accept thread owns the socket and
+        // closes it in runAirPlayServer's finally block.
         Thread({ runAirPlayServer(server, setup.config, setup.identity, setup.pairings, setup.mfi, setup.media) }, "legacy-airplay-server").apply {
             isDaemon = true
             start()
@@ -325,14 +330,15 @@ class LegacyWirelessController(
                 widthPixels = displayWidth,
                 heightPixels = displayHeight,
                 // 30 fps over a weak 2.4 GHz link leaves twice the bitrate budget per frame,
-                // so fast-changing scenes stay sharp instead of being crushed by iPhone rate control.
-                fps = 30,
+                // so fast-changing scenes stay sharp instead of being crushed by iPhone rate
+                // control. The settings screen can raise it to 60.
+                fps = LegacySettings.fps(context),
                 primaryInputDevice = 1,
             ),
             cluster = null,
-            rightHandDrive = false,
+            rightHandDrive = LegacySettings.rightHandDrive(context),
             port = 7100,
-            hevc = false,
+            hevc = LegacySettings.hevc(context),
             disableAudioOutput = false,
             microphone = false,
             microphoneOpus = false,
@@ -399,26 +405,42 @@ class LegacyWirelessController(
         mfi: LocalMfiAuthenticationClient,
         media: CarPlayMediaEngine,
     ) {
-        while (!closed.get()) {
-            val socket: Socket = try {
-                server.accept()
-            } catch (e: Exception) {
-                if (closed.get()) return
-                failure("AirPlay listen", e)
-                return
+        // A bounded accept is what lets close() release the port. A plain accept() on API 17
+        // stays parked in the kernel even after the ServerSocket fd is closed, and the parked
+        // thread's pending accept keeps the LISTEN socket alive. The next start would then hit
+        // EADDRINUSE on the AirPlay port. The timeout re-enters accept every 500 ms, so the
+        // loop sees the closed flag and exits.
+        server.soTimeout = 500
+        try {
+            while (!closed.get()) {
+                val socket: Socket = try {
+                    server.accept()
+                } catch (e: SocketTimeoutException) {
+                    continue
+                } catch (e: Exception) {
+                    if (closed.get()) return
+                    failure("AirPlay listen", e)
+                    return
+                }
+                try {
+                    log("received AirPlay TCP connection")
+                    socket.tcpNoDelay = true
+                    socket.keepAlive = true
+                    val session = AirPlaySession(socket, config, identity, pairings, mfi, sessionListener, media)
+                    sessions += session
+                    session.start()
+                } catch (e: Throwable) {
+                    runCatching { socket.close() }
+                    if (closed.get()) return
+                    failure("AirPlay session", e)
+                }
             }
-            try {
-                log("received AirPlay TCP connection")
-                socket.tcpNoDelay = true
-                socket.keepAlive = true
-                val session = AirPlaySession(socket, config, identity, pairings, mfi, sessionListener, media)
-                sessions += session
-                session.start()
-            } catch (e: Throwable) {
-                runCatching { socket.close() }
-                if (closed.get()) return
-                failure("AirPlay session", e)
-            }
+        } finally {
+            // Close the listener on the accept thread itself. See the note at the bind site:
+            // a close() from the shutdown thread leaves the LISTEN socket pinned in the kernel
+            // on this head unit, so this thread owns the server socket end to end.
+            runCatching { server.close() }
+            log("AirPlay server listener closed")
         }
     }
 

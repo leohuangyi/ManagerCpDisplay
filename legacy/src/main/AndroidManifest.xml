@@ -43,6 +43,21 @@
                 android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
                 android:resource="@xml/usb_device_filter" />
         </activity>
+
+        <!-- Settings as its own launcher entry so the head unit's app list shows CarPlay设置. -->
+        <activity
+            android:name=".LegacySettingsActivity"
+            android:exported="true"
+            android:configChanges="keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+            android:label="@string/settings_name"
+            android:launchMode="singleTop"
+            android:taskAffinity="local.airuize.diplaylegacy.settings"
+            android:screenOrientation="landscape">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
     </application>
 
 </manifest>

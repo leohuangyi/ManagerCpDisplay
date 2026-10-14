@@ -83,13 +83,22 @@ object LegacyWirelessHost {
                 log("wireless connection failure: $reason")
                 onStatus("Connection failed: $reason")
             },
-            networkMode = "auto",
+            networkMode = LegacySettings.networkMode(appContext),
         )
         controller = next
-        val phone = findPhone() ?: run {
+        // No paired iPhone: do not give up on the start. The pairing happens in the head
+        // unit's Bluetooth settings, outside the app, so keep polling until a device shows
+        // up and then boot the session. The activity shows its pairing hint meanwhile.
+        var phone = findPhone()
+        if (phone == null) {
             log("no paired iPhone found; pair an iPhone over Bluetooth first")
             onStatus("No paired iPhone found\nPair an iPhone over Bluetooth first")
-            return
+        }
+        while (phone == null) {
+            Thread.sleep(3000L)
+            if (controller !== next) return // shut down while waiting for a pairing
+            phone = findPhone()
+            if (phone != null) log("paired iPhone found: ${phone.name ?: phone.address}")
         }
         log("starting wireless CarPlay with ${phone.name ?: phone.address}")
         next.start(phone)

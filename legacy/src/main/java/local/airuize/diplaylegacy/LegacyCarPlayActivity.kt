@@ -1,12 +1,19 @@
 package local.airuize.diplaylegacy
 
 import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.Settings
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -61,9 +68,47 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    /** The Bluetooth rune, drawn in code because no API 17 font glyph is guaranteed. */
+    private class BluetoothRuneView(context: Context) : View(context) {
+        private val paint = Paint().apply {
+            isAntiAlias = true
+            style = Paint.Style.FILL
+            color = Color.WHITE
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            val w = width.toFloat()
+            val h = height.toFloat()
+            val stemLeft = 0.22f * w
+            canvas.drawRect(stemLeft, 0.12f * h, stemLeft + 0.10f * w, 0.88f * h, paint)
+            canvas.drawPath(Path().apply {
+                moveTo(stemLeft, 0.18f * h)
+                lineTo(0.82f * w, 0.34f * h)
+                lineTo(stemLeft, 0.50f * h)
+                close()
+            }, paint)
+            canvas.drawPath(Path().apply {
+                moveTo(stemLeft, 0.50f * h)
+                lineTo(0.82f * w, 0.66f * h)
+                lineTo(stemLeft, 0.82f * h)
+                close()
+            }, paint)
+        }
+    }
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private var splash: View? = null
     private var status: TextView? = null
+    /** The branded card (icon, title, check list, status) inside the splash overlay. */
+    private var loadingCard: View? = null
+    /** The pairing hint shown when the head unit has no paired iPhone yet. */
+    private var waitingView: View? = null
+    private var waitingShown = false
+    /** The start prompt shown when auto-connect is off and no session has been started. */
+    private var connectPrompt: View? = null
+    private var promptShown = false
+    private var manualStart = false
+    private var pendingHolder: SurfaceHolder? = null
     private val rows = arrayOfNulls<StepRow>(STAGE_SCREEN)
     private var stage = 0
     private var started = false
@@ -201,10 +246,146 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
         }
         content.addView(statusView, centered(dp(16f)))
         status = statusView
+        loadingCard = content
+
+        // Pairing-hint card for when the head unit has no paired iPhone. It replaces the
+        // check list until the pairing shows up (the host polls in the background), and
+        // carries a shortcut to the Bluetooth settings where the pairing happens.
+        val waiting = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(Color.BLACK)
+            visibility = View.GONE
+        }
+        val badge = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(0xFF1565C0.toInt())
+            }
+        }
+        badge.addView(
+            BluetoothRuneView(this),
+            FrameLayout.LayoutParams(dp(44f), dp(44f), Gravity.CENTER),
+        )
+        waiting.addView(badge, centered(0).apply {
+            width = dp(104f)
+            height = dp(104f)
+        })
+
+        waiting.addView(TextView(this).apply {
+            text = "等待连接"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 30f)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+        }, centered(dp(24f)))
+
+        waiting.addView(TextView(this).apply {
+            text = "没有发现已配对的 iPhone"
+            setTextColor(COLOR_ACTIVE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            gravity = Gravity.CENTER
+        }, centered(dp(10f)))
+
+        waiting.addView(TextView(this).apply {
+            text = "请开启车机蓝牙，并在蓝牙设置中\n与 iPhone 完成配对，配对成功后将自动连接"
+            setTextColor(COLOR_LABEL)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            gravity = Gravity.CENTER
+        }, centered(dp(12f)))
+
+        waiting.addView(TextView(this).apply {
+            text = "打开蓝牙设置"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setPadding(dp(36f), 0, dp(36f), 0)
+            background = GradientDrawable().apply {
+                cornerRadius = dp(22f).toFloat()
+                setColor(0xFF1565C0.toInt())
+            }
+            setOnClickListener {
+                runCatching { startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }
+            }
+        }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, dp(44f)
+        ).apply {
+            topMargin = dp(24f)
+        })
+
+        val finderRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        finderRow.addView(
+            ProgressBar(this, null, android.R.attr.progressBarStyleSmall),
+            LinearLayout.LayoutParams(dp(22f), dp(22f)).apply {
+                rightMargin = dp(8f)
+            },
+        )
+        finderRow.addView(TextView(this).apply {
+            text = "正在查找已配对的设备…"
+            setTextColor(COLOR_FADED)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            gravity = Gravity.CENTER
+        })
+        waiting.addView(finderRow, centered(dp(20f)))
+        waitingView = waiting
+
+        // Start prompt for auto-connect off: replaces the check list until the driver
+        // taps the connect button. Same look as the pairing hint.
+        val prompt = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(Color.BLACK)
+            visibility = View.GONE
+        }
+        prompt.addView(TextView(this).apply {
+            text = "尚未连接"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 30f)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+        }, centered(dp(0f)))
+        prompt.addView(TextView(this).apply {
+            text = "自动连接已关闭"
+            setTextColor(COLOR_ACTIVE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            gravity = Gravity.CENTER
+        }, centered(dp(12f)))
+        prompt.addView(TextView(this).apply {
+            text = "点击下方按钮开始连接 iPhone"
+            setTextColor(COLOR_LABEL)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            gravity = Gravity.CENTER
+        }, centered(dp(8f)))
+        prompt.addView(TextView(this).apply {
+            text = "开始连接"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setPadding(dp(36f), 0, dp(36f), 0)
+            background = GradientDrawable().apply {
+                cornerRadius = dp(22f).toFloat()
+                setColor(0xFF1565C0.toInt())
+            }
+            setOnClickListener { startManualConnect() }
+        }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, dp(44f)
+        ).apply {
+            topMargin = dp(24f)
+        })
+        connectPrompt = prompt
 
         val overlay = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             addView(content, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(waiting, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(prompt, FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
         root.addView(overlay, FrameLayout.LayoutParams(
@@ -278,12 +459,60 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
     private fun setStage(newStage: Int) {
         if (destroyed) return
         runOnUiThread {
+            exitWaiting()
             if (newStage <= stage) return@runOnUiThread
             stage = newStage
             Log.i(TAG, "stage $newStage")
             for (index in 0 until newStage) stepState(row(index), StepRow.DONE)
             if (newStage < STAGE_SCREEN) stepState(row(newStage), StepRow.ACTIVE)
         }
+    }
+
+    /** No paired iPhone: swap the check list for the pairing hint until one appears. */
+    private fun showWaiting() {
+        if (destroyed || waitingShown || waitingView == null) return
+        waitingShown = true
+        runOnUiThread {
+            val waiting = waitingView ?: return@runOnUiThread
+            loadingCard?.visibility = View.INVISIBLE
+            waiting.visibility = View.VISIBLE
+            waiting.alpha = 0f
+            waiting.animate().alpha(1f).setDuration(400).start()
+        }
+    }
+
+    /** A device turned up (or the flow moved on): bring the check list back. */
+    private fun exitWaiting() {
+        if (!waitingShown) return
+        waitingShown = false
+        loadingCard?.visibility = View.VISIBLE
+        waitingView?.visibility = View.GONE
+    }
+
+    /** Auto-connect is off and no session started: swap the check list for the start prompt. */
+    private fun showConnectPrompt(holder: SurfaceHolder) {
+        pendingHolder = holder
+        if (promptShown) return
+        promptShown = true
+        runOnUiThread {
+            loadingCard?.visibility = View.INVISIBLE
+            val prompt = connectPrompt ?: return@runOnUiThread
+            prompt.visibility = View.VISIBLE
+            prompt.alpha = 0f
+            prompt.animate().alpha(1f).setDuration(400).start()
+        }
+    }
+
+    /** The driver tapped 开始连接: hide the prompt and boot the session as usual. */
+    private fun startManualConnect() {
+        if (started) return
+        manualStart = true
+        runOnUiThread {
+            connectPrompt?.visibility = View.GONE
+            loadingCard?.visibility = View.VISIBLE
+        }
+        val holder = pendingHolder ?: return
+        startHost(holder)
     }
 
     /** The session dropped during start: the CarPlay step runs again, screen pending. */
@@ -310,7 +539,7 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
             status?.text = text
             when {
                 text.startsWith("Connection failed") -> failActiveRow()
-                text.startsWith("No paired iPhone found") -> failActiveRow()
+                text.startsWith("No paired iPhone found") -> showWaiting()
                 text.startsWith("Waiting for the iPhone to reconnect") -> rewindToSession()
             }
         }
@@ -369,6 +598,10 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
                 Log.i(TAG, "surface recreated; reattaching live session")
             }
             LegacyWirelessHost.attachSurface(recreated)
+            return
+        }
+        if (!manualStart && !LegacySettings.autoConnect(this)) {
+            showConnectPrompt(holder)
             return
         }
         started = true
