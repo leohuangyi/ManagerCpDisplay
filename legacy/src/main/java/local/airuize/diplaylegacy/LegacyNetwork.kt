@@ -161,8 +161,6 @@ class LegacyNetwork(
     // no tethering screen. The only working soft-AP is the native three-step sequence
     // (hostapd -> static IP -> dnsmasq), so this mode drives it directly as root.
     private fun prepareAuto(): Endpoint {
-        val (ssid, password, channel) = readHotspotConfig()
-
         // Fast path: this mode's hotspot is already up, keep the connection intact.
         // InetAddress.toString() prefixes a slash ("/192.168.43.1"), compare hostAddress.
         // The address alone is not enough: the kernel keeps the static address after
@@ -176,16 +174,19 @@ class LegacyNetwork(
         ) {
             hotspotStartedByUs = false
             raiseRmemMax()
+            val (ssid, password, channel) = hotspotProfile()
             log("Network mode=$networkMode interface=${existing.first.name} already up")
             return Endpoint(ssid, password, channel, existing.first, existing.second)
         }
 
-        val (idRc, idOut) = runSu(SU_ID, timeoutSeconds = 5)
-        if (idRc != 0 || !idOut.contains("uid=0")) {
+        // Heavy path: one su call covers the root check, the firmware's hotspot profile and
+        // the rmem_max raise. Three separate su spawns cost about a second each on this unit.
+        val (prepRc, prepOut) = runSu(SU_HOTSPOT_PREP, timeoutSeconds = 8)
+        if (prepRc != 0 || !prepOut.contains("uid=0")) {
             throw IllegalStateException("Hotspot automation needs root: grant su once over USB adb")
         }
+        val (ssid, password, channel) = parseAndCacheHotspotProfile(prepOut)
 
-        raiseRmemMax()
         val (upRc, upOut) = runSu(hotspotUpScript(ssid, password, channel))
         log("Hotspot up rc=$upRc out=${upOut.trim().take(300)}")
         check(upRc == 0) { "Hotspot startup failed rc=$upRc" }
@@ -225,25 +226,46 @@ class LegacyNetwork(
             SU_HOTSPOT_UP_TAIL
     }
 
-    /** Reads (ssid, passphrase, channel) from /data/misc/wifi/hostapd.conf, falling back to the known defaults. */
-    private fun readHotspotConfig(): Triple<String, String, Int> {
+    /**
+     * The (ssid, passphrase, channel) the broadcast AP uses. The heavy path reads them from
+     * the firmware's hostapd.conf over su and caches the triple, so a later fast path can
+     * rebuild the endpoint without paying another su spawn. A cold cache falls back to one
+     * su read (or the known defaults when root is unavailable).
+     */
+    private fun hotspotProfile(): Triple<String, String, Int> {
+        val prefs = context.getSharedPreferences("legacy-network", Context.MODE_PRIVATE)
+        val cachedSsid = prefs.getString("hotspotSsid", null)
+        val cachedPassword = prefs.getString("hotspotPassword", null)
+        val cachedChannel = prefs.getInt("hotspotChannel", -1)
+        if (cachedSsid != null && cachedPassword != null && cachedChannel > 0) {
+            return Triple(cachedSsid, cachedPassword, cachedChannel)
+        }
+        val (rc, out) = runSu(SU_HOTSPOT_PREP, timeoutSeconds = 8)
+        if (rc != 0) return Triple("DiPlay-Legacy", "diplay1234", 6)
+        return parseAndCacheHotspotProfile(out)
+    }
+
+    /** Parses (ssid, passphrase, channel) from the combined su prep output, falling back to the known defaults. */
+    private fun parseAndCacheHotspotProfile(out: String): Triple<String, String, Int> {
         var ssid = "DiPlay-Legacy"
         var password = "diplay1234"
         var channel = 6
-        val (rc, out) = runSu("cat /data/misc/wifi/hostapd.conf", timeoutSeconds = 5)
-        if (rc == 0) {
-            for (line in out.lines()) {
-                val eq = line.indexOf('=')
-                if (eq <= 0) continue
-                val key = line.substring(0, eq).trim()
-                val value = line.substring(eq + 1).trim()
-                when (key) {
-                    "ssid" -> ssid = value
-                    "wpa_passphrase" -> password = value
-                    "channel" -> channel = value.toIntOrNull() ?: channel
-                }
+        for (line in out.lines()) {
+            val eq = line.indexOf('=')
+            if (eq <= 0) continue
+            val key = line.substring(0, eq).trim()
+            val value = line.substring(eq + 1).trim()
+            when (key) {
+                "ssid" -> ssid = value
+                "wpa_passphrase" -> password = value
+                "channel" -> channel = value.toIntOrNull() ?: channel
             }
         }
+        context.getSharedPreferences("legacy-network", Context.MODE_PRIVATE).edit()
+            .putString("hotspotSsid", ssid)
+            .putString("hotspotPassword", password)
+            .putInt("hotspotChannel", channel)
+            .commit()
         return Triple(ssid, password, channel)
     }
 
@@ -479,7 +501,14 @@ class LegacyNetwork(
     private companion object {
         const val AP_STATE_ENABLED = 13
 
-        const val SU_ID = "id"
+        // One su round-trip for the three pre-flight steps the heavy path used to run
+        // separately: the root check, the firmware hotspot profile read and the rmem_max
+        // raise. Each su spawn costs about a second on the MY16ADA; rmem_max goes last so
+        // this script's exit code reflects it.
+        const val SU_HOTSPOT_PREP =
+            "id; " +
+                "cat /data/misc/wifi/hostapd.conf 2>/dev/null; " +
+                "echo 2097152 > /proc/sys/net/core/rmem_max"
 
         // The miwifi kernel boots with net.core.rmem_max=131071, capping SO_RCVBUF at
         // ~256 KB and shrinking the SYN-time window scale. Raise it before the video
@@ -507,8 +536,9 @@ class LegacyNetwork(
         // root gets EACCES there) and rewrites its own hostapd.conf back to the 11g template,
         // so injecting into that file is unreliable. A private conf sidesteps both.
         const val SU_HOTSPOT_UP_PREFIX = SU_KILL_DNSMASQ +
-            "for p in /proc/[0-9]*; do [ \${p#/proc/} -eq \$\$ ] && continue; c=\$(cat \$p/cmdline 2>/dev/null); case \$c in *hostapd*) kill \${p#/proc/} 2>/dev/null ;; esac; done; " +
-            "sleep 1; setprop ctl.stop mdnsd; ifconfig wlan0 down; "
+            "k=0; for p in /proc/[0-9]*; do [ \${p#/proc/} -eq \$\$ ] && continue; " +
+            "c=\$(cat \$p/cmdline 2>/dev/null); case \$c in *hostapd*) kill \${p#/proc/} 2>/dev/null; k=1 ;; esac; done; " +
+            "[ \$k -gt 0 ] && sleep 1; setprop ctl.stop mdnsd; ifconfig wlan0 down; "
 
         // hostapd drops privileges to AID_WIFI after starting, so a root-owned 600 conf
         // is unreadable ("Could not open configuration file" in logcat) and the AP never

@@ -6,6 +6,7 @@ import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -15,35 +16,70 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
+import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
 
 /**
  * Minimal API 17 host screen. Holds the CarPlay video SurfaceView, shows a branded loading
- * screen with live progress, and fades it out once the CarPlay screen stream becomes active.
+ * screen whose check list follows the real start milestones, and fades it out once the
+ * CarPlay screen stream becomes active.
  */
 class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
     companion object {
         private const val TAG = "LegacyCarPlayActivity"
+
+        /** Loading-screen steps; stage N means steps 1..N are checked off. */
+        private const val STAGE_HOTSPOT = 1
+        private const val STAGE_IPHONE = 2
+        private const val STAGE_CARPLAY = 3
+        private const val STAGE_SCREEN = 4
+
+        private const val COLOR_PENDING = 0xFF546E7A.toInt()
+        private const val COLOR_LABEL = 0xFF90A4AE.toInt()
+        private const val COLOR_FADED = 0xFF78909C.toInt()
+        private const val COLOR_ACTIVE = 0xFFECEFF1.toInt()
+        private const val COLOR_DONE = 0xFF81C784.toInt()
+        private const val COLOR_FAILED = 0xFFEF5350.toInt()
+    }
+
+    /** One row of the loading check list: a state glyph area plus its label. */
+    private class StepRow(
+        val container: LinearLayout,
+        val glyph: TextView,
+        val spinner: ProgressBar,
+        val label: TextView,
+    ) {
+        companion object {
+            const val PENDING = 0
+            const val ACTIVE = 1
+            const val DONE = 2
+            const val FAILED = 3
+        }
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val dotFrames = arrayOf("", ".", "..", "...")
-    private var dotFrame = 0
     private var splash: View? = null
     private var status: TextView? = null
-    private var dots: TextView? = null
+    private val rows = arrayOfNulls<StepRow>(STAGE_SCREEN)
+    private var stage = 0
     private var started = false
     private var splashHidden = false
     private var destroyed = false
+    /** The surface currently bound to the live session; reattach only when it is replaced. */
+    private var boundSurface: Surface? = null
+    /** Monotonic clock when the activity was created; logged when the first frame arrives. */
+    private var coldStartAt = 0L
 
     // -- lifecycle -------------------------------------------------------------------
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        coldStartAt = SystemClock.elapsedRealtime()
         setContentView(buildUi())
-        startDots()
     }
 
     override fun onDestroy() {
@@ -51,6 +87,7 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
         mainHandler.removeCallbacksAndMessages(null)
         LegacyWirelessHost.shutdown()
         started = false
+        boundSurface = null
         super.onDestroy()
     }
 
@@ -58,7 +95,8 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
 
     private fun buildUi(): FrameLayout {
         val density = resources.displayMetrics.density
-        val pad = (24f * density).toInt()
+        fun dp(value: Float): Int = (value * density).toInt()
+        val pad = dp(24f)
 
         val root = FrameLayout(this)
         root.setBackgroundColor(Color.BLACK)
@@ -68,50 +106,101 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
         root.addView(surfaceView, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
+        // Branded loading card: icon and title on top, then the check list that follows the
+        // host milestones, then a two-line status area until the first frame replaces it.
         val content = LinearLayout(this)
         content.orientation = LinearLayout.VERTICAL
         content.gravity = Gravity.CENTER
 
+        fun centered(top: Int, bottom: Int = 0): LinearLayout.LayoutParams =
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = top
+                bottomMargin = bottom
+            }
+
+        val icon = ImageView(this).apply {
+            setImageResource(R.mipmap.ic_launcher)
+        }
+        content.addView(icon, centered(0).apply {
+            width = dp(84f)
+            height = dp(84f)
+        })
+
         val title = TextView(this).apply {
             text = "DiPlay"
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 40f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 34f)
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
-            setPadding(pad, 0, pad, 0)
         }
-        content.addView(title, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        content.addView(title, centered(dp(12f)))
 
         val subtitle = TextView(this).apply {
             text = "Wireless CarPlay"
-            setTextColor(0xFF9E9E9E.toInt())
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            setTextColor(COLOR_LABEL)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             gravity = Gravity.CENTER
         }
-        content.addView(subtitle, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        content.addView(subtitle, centered(dp(4f)))
+
+        val stepLabels = arrayOf(
+            "Start the Wi-Fi hotspot",
+            "Connect to iPhone",
+            "Start the CarPlay session",
+            "Show the screen",
+        )
+        val steps = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        for (index in stepLabels.indices) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            val glyph = TextView(this).apply {
+                text = "\u25cb" // ○: this step has not started yet
+                setTextColor(COLOR_PENDING)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                gravity = Gravity.CENTER
+            }
+            val spinner = ProgressBar(this, null, android.R.attr.progressBarStyleSmall).apply {
+                visibility = View.INVISIBLE
+            }
+            val glyphArea = FrameLayout(this).apply {
+                addView(glyph, FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+                addView(spinner, FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.CENTER))
+            }
+            val label = TextView(this).apply {
+                text = stepLabels[index]
+                setTextColor(if (index == 0) COLOR_ACTIVE else COLOR_FADED)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            }
+            row.addView(glyphArea, LinearLayout.LayoutParams(dp(36f), dp(28f)))
+            row.addView(label, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            steps.addView(row, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(30f)))
+            rows[index] = StepRow(row, glyph, spinner, label)
+        }
+        content.addView(steps, centered(dp(22f)).apply {
+            leftMargin = pad
+            rightMargin = pad
+        })
 
         val statusView = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            text = "Preparing the connection…"
+            setTextColor(COLOR_LABEL)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             gravity = Gravity.CENTER
-            setPadding(pad, pad, pad, 0)
+            minLines = 2
+            setPadding(pad, 0, pad, 0)
         }
-        content.addView(statusView, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        content.addView(statusView, centered(dp(16f)))
         status = statusView
-
-        val dotsView = TextView(this).apply {
-            setTextColor(0xFF9E9E9E.toInt())
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
-            gravity = Gravity.CENTER
-        }
-        val dotsParams = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        dotsParams.topMargin = pad / 2
-        content.addView(dotsView, dotsParams)
-        dots = dotsView
 
         val overlay = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -122,35 +211,125 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         splash = overlay
 
+        // The fleet hardware pauses a beat on cold start; without an entrance a silent
+        // black frame reads as a hang. Fade the card in, pop the icon, and let each step
+        // rise into place so the list builds up as the connection does.
+        content.alpha = 0f
+        content.animate().alpha(1f).setStartDelay(100).setDuration(600).start()
+        icon.scaleX = 0.8f
+        icon.scaleY = 0.8f
+        icon.animate().scaleX(1f).scaleY(1f).setDuration(500).start()
+        var delay = 200L
+        for (row in rows) {
+            val item = row ?: continue
+            item.container.alpha = 0f
+            item.container.translationY = dp(8f).toFloat()
+            item.container.animate().alpha(1f).translationY(0f)
+                .setStartDelay(delay).setDuration(350).start()
+            delay += 70L
+        }
+
         return root
     }
 
-    /** A tiny animated liveness hint under the status line, so a long phone handshake reads as progress. */
-    private fun startDots() {
-        mainHandler.post(object : Runnable {
-            override fun run() {
-                if (destroyed || splashHidden) return
-                dots?.text = dotFrames[dotFrame]
-                dotFrame = (dotFrame + 1) % dotFrames.size
-                mainHandler.postDelayed(this, 400L)
+    private fun row(index: Int): StepRow = rows[index]!!
+
+    /** Sets one check-list row to its visual state; DONE pops the check mark in. */
+    private fun stepState(item: StepRow, state: Int) {
+        when (state) {
+            StepRow.ACTIVE -> {
+                item.glyph.visibility = View.INVISIBLE
+                item.spinner.visibility = View.VISIBLE
+                item.label.setTextColor(COLOR_ACTIVE)
             }
-        })
+            StepRow.DONE -> {
+                item.spinner.visibility = View.INVISIBLE
+                item.glyph.visibility = View.VISIBLE
+                item.glyph.text = "\u2713" // ✓
+                item.glyph.setTextColor(COLOR_DONE)
+                item.glyph.alpha = 0f
+                item.glyph.scaleX = 0.4f
+                item.glyph.scaleY = 0.4f
+                item.glyph.animate().alpha(1f).scaleX(1f).scaleY(1f)
+                    .setDuration(320).setInterpolator(OvershootInterpolator(2.5f)).start()
+                item.label.setTextColor(COLOR_LABEL)
+            }
+            StepRow.PENDING -> {
+                item.spinner.visibility = View.INVISIBLE
+                item.glyph.visibility = View.VISIBLE
+                item.glyph.text = "\u25cb" // ○
+                item.glyph.setTextColor(COLOR_PENDING)
+                item.glyph.alpha = 1f
+                item.label.setTextColor(COLOR_FADED)
+            }
+            StepRow.FAILED -> {
+                item.spinner.visibility = View.INVISIBLE
+                item.glyph.visibility = View.VISIBLE
+                item.glyph.text = "\u2717" // ✗
+                item.glyph.setTextColor(COLOR_FAILED)
+                item.glyph.alpha = 0f
+                item.glyph.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(300).start()
+                item.label.setTextColor(COLOR_ACTIVE)
+            }
+        }
+    }
+
+    /** Stage N = steps 1..N done and step N+1 running. */
+    private fun setStage(newStage: Int) {
+        if (destroyed) return
+        runOnUiThread {
+            if (newStage <= stage) return@runOnUiThread
+            stage = newStage
+            Log.i(TAG, "stage $newStage")
+            for (index in 0 until newStage) stepState(row(index), StepRow.DONE)
+            if (newStage < STAGE_SCREEN) stepState(row(newStage), StepRow.ACTIVE)
+        }
+    }
+
+    /** The session dropped during start: the CarPlay step runs again, screen pending. */
+    private fun rewindToSession() {
+        runOnUiThread {
+            if (stage <= STAGE_IPHONE) return@runOnUiThread
+            stage = STAGE_IPHONE
+            for (index in STAGE_IPHONE + 1 until STAGE_SCREEN) {
+                stepState(row(index), StepRow.PENDING)
+            }
+            stepState(row(STAGE_IPHONE), StepRow.ACTIVE)
+        }
+    }
+
+    /** Marks whatever step was running as failed; the status area shows the reason. */
+    private fun failActiveRow() {
+        runOnUiThread { stepState(row(stage.coerceIn(0, STAGE_SCREEN - 1)), StepRow.FAILED) }
     }
 
     /** Status updates arrive from the host's background threads; all UI work stays on the main thread. */
     private fun setStatus(text: String) {
         if (destroyed) return
-        runOnUiThread { status?.text = text }
+        runOnUiThread {
+            status?.text = text
+            when {
+                text.startsWith("Connection failed") -> failActiveRow()
+                text.startsWith("No paired iPhone found") -> failActiveRow()
+                text.startsWith("Waiting for the iPhone to reconnect") -> rewindToSession()
+            }
+        }
     }
 
     private fun hideSplash() {
         if (destroyed || splashHidden) return
         splashHidden = true
+        Log.i(TAG, "first CarPlay frame after ${SystemClock.elapsedRealtime() - coldStartAt} ms")
         runOnUiThread {
             mainHandler.removeCallbacksAndMessages(null)
-            val view = splash ?: return@runOnUiThread
-            view.animate().alpha(0f).setDuration(500)
-                .withEndAction { view.visibility = View.GONE }
+            stage = STAGE_SCREEN
+            stepState(row(STAGE_SCREEN - 1), StepRow.DONE)
+            // Let the last check land before the picture takes over.
+            mainHandler.postDelayed({
+                val view = splash ?: return@postDelayed
+                view.animate().alpha(0f).setDuration(450)
+                    .withEndAction { view.visibility = View.GONE }
+            }, 350L)
         }
     }
 
@@ -165,26 +344,39 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
         Log.e(TAG, "carplay start failed", error)
         runOnUiThread {
             mainHandler.removeCallbacksAndMessages(null)
+            failActiveRow()
             status?.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            status?.setTextColor(0xFFFF8A80.toInt())
+            status?.setTextColor(COLOR_FAILED)
             status?.text = "Start failed: $detail"
-            dots?.visibility = View.INVISIBLE
         }
     }
 
     // -- host handshake ----------------------------------------------------------------
 
     private fun startHost(holder: SurfaceHolder) {
-        if (started) return
         val frame = holder.surfaceFrame
         val width = frame.width()
         val height = frame.height()
         if (width <= 0 || height <= 0) return
+        if (started) {
+            // Back from the background: the CarPlay session lives on and rebinds its main
+            // stream to the holder's surface. Android may hand back the same Surface instance,
+            // so reattach on every callback; the identity check only trims the log spam
+            // (surfaceCreated is followed by surfaceChanged with the same surface).
+            val recreated = holder.surface
+            if (recreated !== boundSurface) {
+                boundSurface = recreated
+                Log.i(TAG, "surface recreated; reattaching live session")
+            }
+            LegacyWirelessHost.attachSurface(recreated)
+            return
+        }
         started = true
         val surface: Surface = holder.surface
+        boundSurface = surface
         setStatus("Preparing the connection…")
-        // The host installs MFI assets and builds the media sink up front, which takes a moment.
-        // Run it off the main thread so the loading screen keeps animating.
+        // The host builds the media sink and starts the controller bootstrap; run it off
+        // the main thread so the loading screen keeps animating.
         Thread({
             try {
                 LegacyWirelessHost.start(
@@ -194,6 +386,7 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
                     height = height,
                     log = { line -> Log.i(TAG, line) },
                     onStatus = { text -> setStatus(text) },
+                    onStage = { step -> setStage(step) },
                     onVideo = { hideSplash() },
                 )
             } catch (error: Throwable) {
@@ -225,6 +418,10 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        Log.i(TAG, "surface destroyed")
+        // The SurfaceHolder contract: everything must leave this surface before the callback
+        // returns, or a recreated one stays black. The main decoder is released and the next
+        // frames start a fresh one on the recreated surface.
+        val confirmed = LegacyWirelessHost.detachSurface(holder.surface)
+        Log.i(TAG, "surface destroyed; detach confirmed=$confirmed")
     }
 }

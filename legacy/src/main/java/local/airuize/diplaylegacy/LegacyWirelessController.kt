@@ -32,6 +32,7 @@ import com.shilapi.xcertplay.transport.Iap2WirelessIdentification
 import com.shilapi.xcertplay.transport.Iap2WirelessSecurity
 import java.io.BufferedReader
 import java.io.Closeable
+import java.io.IOException
 import java.io.InputStreamReader
 import java.net.Inet4Address
 import java.net.InetSocketAddress
@@ -68,6 +69,8 @@ class LegacyWirelessController(
         private const val TAG = "LegacyWireless"
         private const val RFCOMM_UUID = "00000000-deca-fade-deca-deafdecacafe"
         private const val SOURCE_VERSION = "950.7.1"
+        private const val RFCOMM_CONNECT_ATTEMPTS = 3
+        private const val RFCOMM_CONNECT_RETRY_DELAY_MS = 1500L
     }
 
     private val closed = AtomicBoolean(false)
@@ -149,18 +152,169 @@ class LegacyWirelessController(
             }
         wifiLocks += wifiLock
 
-        val network = LegacyNetwork(context, networkMode, { closed.get() }, log).also { resources += it }
-        val endpoint = network.prepare()
-
         val btMac = adapter.address ?: throw IllegalStateException("unable to read Bluetooth address")
-        val deviceId = deviceId(endpoint.iface)
 
+        // A cold start used to run its three independent stages back to back: hotspot bring-up
+        // (the long pole), MFi/media session setup, and the HFP disconnect that frees the
+        // RFCOMM channel. They now run on three parallel tracks and meet at a latch; a failure
+        // on any track aborts the bootstrap without waiting for the others. The latch gives
+        // the join the visibility a plain volatile read could not guarantee on every JVM.
+        val network = LegacyNetwork(context, networkMode, { closed.get() }, log).also { resources += it }
+        var endpoint: LegacyNetwork.Endpoint? = null
+        var parts: SessionParts? = null
+        val failures = CopyOnWriteArrayList<Throwable>()
+        val tracks = CountDownLatch(3)
+
+        fun track(name: String, work: () -> Unit) {
+            Thread({
+                try {
+                    work()
+                } catch (error: Throwable) {
+                    if (!closed.get()) failures += error
+                } finally {
+                    tracks.countDown()
+                }
+            }, name).apply {
+                isDaemon = true
+                start()
+            }
+        }
+
+        track("legacy-network-prep", { endpoint = network.prepare() })
+        track("legacy-session-prep", { parts = prepareSession(btMac) })
+        track("legacy-hfp-disconnect", { disconnectHfp(phone) })
+
+        while (true) {
+            // Fail fast: keep waiting only while every track is still healthy.
+            failures.firstOrNull()?.let { throw it }
+            try {
+                if (tracks.await(500, TimeUnit.MILLISECONDS)) break
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw InterruptedException()
+            }
+        }
+        failures.firstOrNull()?.let { throw it }
+        val readyEndpoint = endpoint ?: throw IllegalStateException("Network endpoint unavailable")
+        val setup = parts ?: throw IllegalStateException("Session setup unavailable")
+
+        val identification = Iap2IdentificationConfig(
+            name = "CarPlay",
+            modelIdentifier = "CarPlay",
+            manufacturer = "CarPlay",
+            serialNumber = setup.identity.pairingId,
+            firmwareVersion = "0.21",
+            hardwareVersion = "iMX6",
+            wireless = Iap2WirelessIdentification(btMac, readyEndpoint.ssid),
+        )
+        val wirelessEndpoint = Iap2WirelessCarPlayEndpoint(
+            ssid = readyEndpoint.ssid,
+            passphrase = readyEndpoint.password,
+            channel = readyEndpoint.channel,
+            security = Iap2WirelessSecurity.WPA_WPA2,
+            ipAddresses = listOf(readyEndpoint.address.hostAddress),
+            airPlayPort = setup.config.port,
+            deviceIdentifier = setup.deviceId,
+            publicKey = setup.identity.publicKeyHex,
+            sourceVersion = setup.config.sourceVersion,
+        )
+
+        setup.media.setIapTunnelHandler { stream: BlockingDuplexByteStream ->
+            if (closed.get()) {
+                false
+            } else {
+                log("Wi-Fi iAP2 tunnel request accepted")
+                val tunnelThread = Thread({
+                    try {
+                        val session = Iap2Session.openTunnel(stream)
+                        log("Wi-Fi iAP2 tunnel established")
+                        Iap2WirelessControlClient(session, setup.mfiClient).run(
+                            identification = identification,
+                            endpoint = wirelessEndpoint,
+                            onReady = { log("Wi-Fi iAP2 authenticated; control tunnel ready") },
+                            onProgress = { log("Wi-Fi: $it") },
+                        )
+                    } catch (e: Throwable) {
+                        if (!closed.get()) failure("Wi-Fi iAP2", e)
+                    } finally {
+                        runCatching { stream.close() }
+                    }
+                }, "legacy-iap-tunnel")
+                tunnelThread.isDaemon = true
+                tunnelThread.start()
+                true
+            }
+        }
+
+        val server = LegacyListenerBinder.bind(
+            InetSocketAddress(readyEndpoint.address, setup.config.port),
+            { closed.get() },
+            { attempt -> if (attempt == 1) log("AirPlay port busy; waiting up to 5s") },
+        )
+        resources += server
+        Thread({ runAirPlayServer(server, setup.config, setup.identity, setup.pairings, setup.mfi, setup.media) }, "legacy-airplay-server").apply {
+            isDaemon = true
+            start()
+        }
+
+        val mcLock = wifi.createMulticastLock("legacy-carplay-mdns").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+        multicastLock = mcLock
+
+        val dns = JmDNS.create(readyEndpoint.address, "DiPlay-Legacy")
+        resources += dns
+        dns.registerService(
+            ServiceInfo.create(
+                "_airplay._tcp.local.",
+                setup.config.deviceName,
+                setup.config.port,
+                0,
+                0,
+                CarPlayBonjourProtocol.airPlayTxtRecords(setup.config, setup.identity),
+            ),
+        )
+        dns.addServiceListener(
+            "_carplay-ctrl._tcp.local.",
+            controlServiceListener(readyEndpoint.address, setup.config, setup.deviceId),
+        )
+
+        log("listening on ${readyEndpoint.iface.name}; starting Bluetooth handshake")
+        runBluetoothBootstrap(phone, setup.mfiClient, identification, wirelessEndpoint)
+        log("Bluetooth bootstrap ended; waiting for Wi-Fi session")
+    }
+
+    /**
+     * Everything the bootstrap builds that is independent of the live network endpoint: identity,
+     * pairings, MFi client, AirPlay config and the media engine. Prepared on a parallel track
+     * while the hotspot comes up.
+     */
+    private class SessionParts(
+        val config: AirPlayConfig,
+        val identity: AirPlayIdentity,
+        val pairings: PairingStore,
+        val mfi: LocalMfiAuthenticationClient,
+        val mfiClient: Iap2MfiAuthenticationClient,
+        val media: CarPlayMediaEngine,
+        val deviceId: String,
+    )
+
+    /**
+     * Builds the session parts on their own track. The wlan0 MAC is static in the firmware, so
+     * the device id can be resolved before the hotspot is up; the nil-interface fallback in
+     * [deviceId] keeps the stored id. MFi asset installation moved here from the host so it
+     * overlaps the hotspot bring-up instead of preceding it.
+     */
+    private fun prepareSession(btMac: String): SessionParts {
         val identity = loadIdentity(context)
         val pairings = loadPairings(context)
 
         LegacyCarPlayHost.installMfi(context)
         val mfi = LocalMfiAuthenticationClient.load(LocalMfiAuthenticationClient.offlineDirectory(context))
         val mfiClient = Iap2MfiAuthenticationClient(mfi)
+
+        val deviceId = deviceId(NetworkInterface.getByName("wlan0"))
 
         val config = AirPlayConfig(
             deviceName = "CarPlay",
@@ -188,93 +342,7 @@ class LegacyWirelessController(
             icons = emptyList(),
         )
         val media = CarPlayMediaEngine(sink = sink, microphoneEnabled = false, audioCaptureDirectory = null)
-
-        val identification = Iap2IdentificationConfig(
-            name = "CarPlay",
-            modelIdentifier = "CarPlay",
-            manufacturer = "CarPlay",
-            serialNumber = identity.pairingId,
-            firmwareVersion = "0.21",
-            hardwareVersion = "iMX6",
-            wireless = Iap2WirelessIdentification(btMac, endpoint.ssid),
-        )
-        val wirelessEndpoint = Iap2WirelessCarPlayEndpoint(
-            ssid = endpoint.ssid,
-            passphrase = endpoint.password,
-            channel = endpoint.channel,
-            security = Iap2WirelessSecurity.WPA_WPA2,
-            ipAddresses = listOf(endpoint.address.hostAddress),
-            airPlayPort = config.port,
-            deviceIdentifier = deviceId,
-            publicKey = identity.publicKeyHex,
-            sourceVersion = config.sourceVersion,
-        )
-
-        media.setIapTunnelHandler { stream: BlockingDuplexByteStream ->
-            if (closed.get()) {
-                false
-            } else {
-                log("Wi-Fi iAP2 tunnel request accepted")
-                val tunnelThread = Thread({
-                    try {
-                        val session = Iap2Session.openTunnel(stream)
-                        log("Wi-Fi iAP2 tunnel established")
-                        Iap2WirelessControlClient(session, mfiClient).run(
-                            identification = identification,
-                            endpoint = wirelessEndpoint,
-                            onReady = { log("Wi-Fi iAP2 authenticated; control tunnel ready") },
-                            onProgress = { log("Wi-Fi: $it") },
-                        )
-                    } catch (e: Throwable) {
-                        if (!closed.get()) failure("Wi-Fi iAP2", e)
-                    } finally {
-                        runCatching { stream.close() }
-                    }
-                }, "legacy-iap-tunnel")
-                tunnelThread.isDaemon = true
-                tunnelThread.start()
-                true
-            }
-        }
-
-        val server = LegacyListenerBinder.bind(
-            InetSocketAddress(endpoint.address, config.port),
-            { closed.get() },
-            { attempt -> if (attempt == 1) log("AirPlay port busy; waiting up to 5s") },
-        )
-        resources += server
-        Thread({ runAirPlayServer(server, config, identity, pairings, mfi, media) }, "legacy-airplay-server").apply {
-            isDaemon = true
-            start()
-        }
-
-        val mcLock = wifi.createMulticastLock("legacy-carplay-mdns").apply {
-            setReferenceCounted(false)
-            acquire()
-        }
-        multicastLock = mcLock
-
-        val dns = JmDNS.create(endpoint.address, "DiPlay-Legacy")
-        resources += dns
-        dns.registerService(
-            ServiceInfo.create(
-                "_airplay._tcp.local.",
-                config.deviceName,
-                config.port,
-                0,
-                0,
-                CarPlayBonjourProtocol.airPlayTxtRecords(config, identity),
-            ),
-        )
-        dns.addServiceListener(
-            "_carplay-ctrl._tcp.local.",
-            controlServiceListener(endpoint.address, config, deviceId),
-        )
-
-        log("listening on ${endpoint.iface.name}; starting Bluetooth handshake")
-        disconnectHfp(phone)
-        runBluetoothBootstrap(phone, mfiClient, identification, wirelessEndpoint)
-        log("Bluetooth bootstrap ended; waiting for Wi-Fi session")
+        return SessionParts(config, identity, pairings, mfi, mfiClient, media, deviceId)
     }
 
     /**
@@ -360,11 +428,39 @@ class LegacyWirelessController(
         identification: Iap2IdentificationConfig,
         endpoint: Iap2WirelessCarPlayEndpoint,
     ) {
-        val socket = phone.createRfcommSocketToServiceRecord(UUID.fromString(RFCOMM_UUID))
+        // This head unit kills a backgrounded process within seconds; when CarPlay was running
+        // the Bluetooth service still holds the phone's RFCOMM channel and a fresh connect
+        // fails with "Device or resource busy". One socket per attempt plus a short wait lets
+        // that stale state clear (or an in-flight HFP disconnect finish) instead of failing
+        // the whole start. Only the connect stage retries: a dropped established session is a
+        // real failure, and the Wi-Fi tunnel keeps the session alive anyway.
+        var attempt = 0
+        var socket: BluetoothSocket? = null
+        while (socket == null && !closed.get()) {
+            attempt += 1
+            val candidate = phone.createRfcommSocketToServiceRecord(UUID.fromString(RFCOMM_UUID))
+            try {
+                candidate.connect()
+                socket = candidate
+                log(if (attempt > 1) "Bluetooth RFCOMM connected on attempt $attempt" else "Bluetooth RFCOMM connected")
+            } catch (e: IOException) {
+                runCatching { candidate.close() }
+                if (!closed.get() && attempt < RFCOMM_CONNECT_ATTEMPTS) {
+                    log("Bluetooth RFCOMM attempt $attempt failed (${e.message}); retrying")
+                    try {
+                        Thread.sleep(RFCOMM_CONNECT_RETRY_DELAY_MS)
+                    } catch (_: InterruptedException) {
+                        return
+                    }
+                } else {
+                    if (!closed.get()) failure("Bluetooth bootstrap", e)
+                    return
+                }
+            }
+        }
+        val connected = socket ?: return
         try {
-            socket.connect()
-            log("Bluetooth RFCOMM connected")
-            val stream = BluetoothRfcommDuplexStream(socket) { log("rfcomm: $it") }
+            val stream = BluetoothRfcommDuplexStream(connected) { log("rfcomm: $it") }
             val session = Iap2Session.openWireless(stream)
             Iap2WirelessControlClient(session, mfiClient).run(
                 identification = identification,
@@ -375,7 +471,7 @@ class LegacyWirelessController(
         } catch (e: Throwable) {
             if (!closed.get()) failure("Bluetooth bootstrap", e)
         } finally {
-            runCatching { socket.close() }
+            runCatching { connected.close() }
         }
     }
 
@@ -423,8 +519,8 @@ class LegacyWirelessController(
         }
     }
 
-    private fun deviceId(iface: NetworkInterface): String {
-        val hw = iface.hardwareAddress
+    private fun deviceId(iface: NetworkInterface?): String {
+        val hw = iface?.hardwareAddress
         if (hw != null && hw.size == 6) {
             return hw.joinToString(":") { "%02X".format(it.toInt() and 0xff) }
         }
