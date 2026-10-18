@@ -36,7 +36,7 @@
     <string name="prompt_button">Connect</string>
 
     <!-- Back key exit confirmation -->
-    <string name="exit_double_press_hint">Press back again to disconnect and return to the home screen</string>
+    <string name="exit_double_press_hint">Press the back key twice to disconnect and return to the home screen</string>
 
     <!-- Settings screen -->
     <string name="caption_connection">Connection</string>
