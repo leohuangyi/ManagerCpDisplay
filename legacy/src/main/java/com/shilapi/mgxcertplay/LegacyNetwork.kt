@@ -465,19 +465,22 @@ class LegacyNetwork(
     }
 
     /**
-     * Re-brings the hotspot up after CarPlay ended and [close] tore it down (final app exit,
-     * not an in-process wireless restart): the head unit would otherwise be left with no AP,
-     * wlan0 cleared and mdnsd stopped. The restore goes through the same su broadcast channel
-     * as the boot path (LocalAdb -> assistant CpManager) and additionally restarts mdnsd so
-     * the head unit regains network access. The single-radio constraint forbids a parallel
-     * `svc wifi enable`, which would fight hostapd over wlan0.
+     * Restores the head unit's client Wi-Fi after CarPlay ended and the app exits for good
+     * (final app exit, not an in-process wireless restart). Tears any leftover hostapd/dnsmasq
+     * hotspot down regardless of who started it — on the fast path the hotspot was reused, not
+     * started by us — and bounces the stack: the station side does not rescan wlan0 by itself
+     * after hostapd released it, so only a disable -> enable cycle makes the head unit rejoin
+     * its saved Wi-Fi networks. Runs over the same su broadcast channel as the boot path
+     * (LocalAdb -> assistant CpManager). The teardown is idempotent, so repeating it after
+     * [close]'s own teardown is harmless; the final `svc wifi enable` decides the exit code.
      */
     fun restoreAfterCarPlay(): Boolean {
-        if (!hotspotStartedByUs) return false
-        val (ssid, password, channel) = hotspotProfile()
-        val (rc, out) = runSu(hotspotUpScript(ssid, password, channel) + " && setprop ctl.start mdnsd", timeoutSeconds = 25)
-        log("Hotspot restore rc=$rc out=${out.trim().take(300)}")
-        return rc == 0 && isHostapdAlive() && isDnsmasqAlive()
+        val (rc, out) = runSu(
+            SU_HOTSPOT_DOWN + "; svc wifi disable; sleep 1; svc wifi enable",
+            timeoutSeconds = 25,
+        )
+        log("Wifi restart rc=$rc out=${out.trim().take(300)}")
+        return rc == 0
     }
 
     private companion object {

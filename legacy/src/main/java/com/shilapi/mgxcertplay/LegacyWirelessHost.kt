@@ -371,18 +371,28 @@ object LegacyWirelessHost {
         val current = controller
         controller = null
         sink = null
-        try {
-            current?.close()
-        } catch (_: Throwable) {
+        // The in-process wireless restart rebuilds the hotspot itself through prepareAuto and
+        // must have the old engine fully closed before the restarter boots the next one, so its
+        // teardown stays synchronous.
+        if (restartingWireless) {
+            try {
+                current?.close()
+            } catch (_: Throwable) {
+            }
+            return
         }
-        // Final exit (not the in-process wireless restart, which rebuilds the hotspot itself
-        // through prepareAuto): after the teardown above the head unit has no AP, a cleared
-        // wlan0 and stopped mdnsd, so restore the hotspot over the su broadcast channel in the
-        // background. Must run after close(): close() tears the hotspot down, and the restore
-        // would otherwise be killed right away. A daemon thread keeps it off the main thread,
-        // since the restore pays several su round-trips that can take tens of seconds.
-        if (!restartingWireless && current != null) {
+        // Final exit (e.g. the double-back-press in LegacyCarPlayActivity): every remaining
+        // step moves off the main thread. close() tears the hotspot down and the restore then
+        // bounces Wi-Fi (svc wifi disable -> enable) over the su broadcast channel, so the head
+        // unit rejoins its saved Wi-Fi networks by itself. Both su round-trips can take tens of
+        // seconds; leaving them on the main thread starved Activity.onDestroy past the 10 s
+        // destroy timeout and the UI appeared to ignore the exit.
+        if (current != null) {
             Thread({
+                try {
+                    current.close()
+                } catch (_: Throwable) {
+                }
                 runCatching { current.restoreHotspotAfterCarPlay() }
                     .onFailure { Log.w(TAG, "Hotspot restore after CarPlay exit failed", it) }
             }, "legacy-hotspot-restore").apply {
