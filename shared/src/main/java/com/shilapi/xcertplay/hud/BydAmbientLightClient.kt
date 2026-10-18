@@ -2,7 +2,6 @@ package com.shilapi.xcertplay.hud
 
 import android.content.Context
 import android.util.Log
-import com.shilapi.xcertplay.adb.AdbKeys
 import com.shilapi.xcertplay.adb.LocalAdb
 import java.security.SecureRandom
 import java.util.concurrent.CompletableFuture
@@ -189,7 +188,7 @@ internal class BydAmbientLightClient(context: Context) : AutoCloseable {
     private fun ensure(ticket: Long) {
         check(ticket == generation.get() && !closed) { "stale-generation" }
         if (stream != null) return
-        val client = LocalAdb(AdbKeys.load(app)); adb = client
+        val client = LocalAdb(app); adb = client
         check(client.connect(mayAsk = false) == LocalAdb.Access.READY) { "adb-unavailable" }
         val next = ByteArray(16).also { SecureRandom().nextBytes(it) }.joinToString("") { "%02x".format(it) }
         token = next

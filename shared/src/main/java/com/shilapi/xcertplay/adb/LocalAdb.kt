@@ -1,263 +1,381 @@
 package com.shilapi.xcertplay.adb
 
-import java.io.BufferedInputStream
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
 import java.io.Closeable
 import java.io.IOException
-import java.io.InputStream
-import java.io.OutputStream
-import java.net.InetSocketAddress
-import java.net.Socket
-import java.net.SocketTimeoutException
-import java.security.KeyPair
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
- * A shell on the head unit's own adbd ("ADB over network", 127.0.0.1:5555), for the few commands an
- * ordinary app may not run, such as switching the BYD cluster's navigation mode. Speaks the plain
- * ADB protocol (AOSP adb/protocol.txt); the TLS variant used by Android 11+ wireless debugging is
- * not supported.
+ * A privileged shell executing in the assistant app ("小助手", `com.automanager`), reached over
+ * broadcast.
  *
- * adbd trusts a key once the driver approves it in the car's "Allow debugging?" dialog. Only
- * [connect] with `mayAsk = true` offers the key for approval. Background use never does, so the
- * dialog cannot appear while driving.
+ * This app no longer owns any root/adb logic: every privileged command is forwarded to the
+ * assistant app's `CpManager`, which runs it with `su` and answers with broadcasts directed back
+ * at this app. There is no local adbd connection and no fallback — when the assistant app is
+ * offline or its answers time out, [connect] reports [Access.UNREACHABLE] and [shell]/[openShell]
+ * fail fast with null.
+ *
+ * Protocol (kept in sync with `com.automanager.cp.CpManager`):
+ * - PROBE → RESULT carrying `capability` = root | no-root | no-su. `root` maps to
+ *   [Access.READY], anything else to [Access.NOT_APPROVED]. A missing answer is
+ *   [Access.UNREACHABLE]. [Access.UNSUPPORTED] is no longer produced but the enum value stays.
+ * - CMD (requestId/command/timeoutMs) → RESULT carrying exit/output/error.
+ * - SWITCH_SOURCE (requestId/sourceId) → RESULT carrying exit; the assistant forwards
+ *   MG_CHANGE_SOURCE_MANUAL so the avap service executes `changeSource(sourceId)`.
+ * - SESSION_OPEN (session/command) → SESSION_ACK (ok/error); afterwards every output line is
+ *   broadcast as SESSION_OUT (line), and the end of the stream is announced with SESSION_OUT
+ *   (closed=true). SESSION_WRITE (data) feeds stdin, SESSION_CLOSE ends the session.
  */
-class LocalAdb(
-    private val key: KeyPair,
-    private val host: String = "127.0.0.1",
-    private val port: Int = 5555,
-) : Closeable {
+class LocalAdb(context: Context) : Closeable {
     enum class Access { READY, NOT_APPROVED, UNREACHABLE, UNSUPPORTED }
 
-    @Volatile private var socket: Socket? = null
-    private val cancelled = AtomicBoolean(false)
-    private var input: InputStream? = null
-    private var output: OutputStream? = null
-    private var nextStreamId = 1
+    /** The exit status and combined output of a one-shot [exec]. */
+    class RootResult(val exit: Int, val output: String?)
 
-    @Synchronized
-    fun connect(mayAsk: Boolean): Access {
-        if (cancelled.get()) return Access.UNREACHABLE
-        if (socket?.isClosed == false) return Access.READY
-        return try {
-            val address = InetSocketAddress(host, port)
-            val opened = Socket().also { socket = it }.apply {
-                if (cancelled.get()) throw IOException("ADB operation cancelled")
-                connect(address, CONNECT_TIMEOUT_MS)
-                soTimeout = READ_TIMEOUT_MS
-                tcpNoDelay = true
-            }
-            socket = opened
-            input = BufferedInputStream(opened.getInputStream())
-            output = opened.getOutputStream()
-            send(AdbPacket(AdbPacket.CNXN, AdbPacket.VERSION, AdbPacket.MAX_PAYLOAD, "host::\u0000".toByteArray()))
-            handshake(mayAsk).also { if (it != Access.READY) closeQuietly() }
-        } catch (_: SocketTimeoutException) {
-            closeQuietly()
-            if (mayAsk) Access.NOT_APPROVED else Access.UNREACHABLE
-        } catch (_: IOException) {
-            closeQuietly()
-            Access.UNREACHABLE
+    private val appContext = context.applicationContext
+    private val cancelled = AtomicBoolean(false)
+    private val closed = AtomicBoolean(false)
+    private val requestIds = AtomicLong(0)
+    private val pending = ConcurrentHashMap<Long, Pending>()
+    private val replyReceiver = ReplyReceiver()
+    @Volatile private var interactive: InteractiveShell? = null
+    @Volatile private var lastReadyAtMillis = 0L
+
+    init {
+        val filter = IntentFilter().apply {
+            addAction(ACTION_CP_RESULT)
+            addAction(ACTION_CP_SESSION_ACK)
+            addAction(ACTION_CP_SESSION_OUT)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // 必须显式 exported：广播来自小助手进程。
+            appContext.registerReceiver(replyReceiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            appContext.registerReceiver(replyReceiver, filter)
         }
     }
 
-    /** Runs [command] in adbd's shell and returns its output, or null if the link failed. */
+    /**
+     * Checks that the assistant app is online and runs commands as root. The old "Allow
+     * debugging?" approval dialog no longer exists: `mayAsk` is accepted for API compatibility
+     * but does not change the probe. A READY answer is cached for 10 s on long-lived clients to
+     * avoid one `su` spawn per background read.
+     */
+    @Synchronized
+    fun connect(mayAsk: Boolean): Access {
+        if (cancelled.get() || closed.get()) return Access.UNREACHABLE
+        val readyAge = System.currentTimeMillis() - lastReadyAtMillis
+        if (readyAge in 0..READY_CACHE_MILLIS) return Access.READY
+        val requestId = requestIds.incrementAndGet()
+        val probe = Pending()
+        pending[requestId] = probe
+        broadcast(ACTION_CP_PROBE) { intent ->
+            intent.putExtra(EXTRA_REQUEST_ID, requestId)
+        }
+        if (!awaitPending(probe, requestId, CONNECT_TIMEOUT_MS)) return Access.UNREACHABLE
+        if (probe.capability == CAP_ROOT) {
+            lastReadyAtMillis = System.currentTimeMillis()
+            return Access.READY
+        }
+        return Access.NOT_APPROVED
+    }
+
+    /** Runs [command] in the assistant app's root shell and returns its output, or null on failure. */
     fun shell(command: String): String? = shell(command, READ_TIMEOUT_MS)
 
-    /** Same as [shell], with a larger bounded read window for a one-shot slow command. */
+    /** Same as [shell], with a larger bounded wait for a one-shot slow command. */
     @Synchronized
     fun shell(command: String, readTimeoutMillis: Int): String? {
-        if (cancelled.get()) return null
-        if (socket?.isClosed != false && connect(mayAsk = false) != Access.READY) return null
-        return try {
-            require(readTimeoutMillis in 1..MAX_COMMAND_TIMEOUT_MS)
-            socket?.soTimeout = readTimeoutMillis
-            val local = nextStreamId++
-            send(AdbPacket(AdbPacket.OPEN, local, 0, "shell:$command\u0000".toByteArray()))
-            var remote = 0
-            var finished = false
-            val text = StringBuilder()
-            while (!finished) {
-                val packet = receive()
-                when {
-                    packet.command == AdbPacket.OKAY && packet.arg1 == local -> remote = packet.arg0
-                    packet.command == AdbPacket.WRTE && packet.arg1 == local -> {
-                        text.append(String(packet.payload, Charsets.UTF_8))
-                        send(AdbPacket(AdbPacket.OKAY, local, packet.arg0, ByteArray(0)))
-                    }
-                    packet.command == AdbPacket.CLSE && packet.arg1 == local -> {
-                        if (remote != 0) send(AdbPacket(AdbPacket.CLSE, local, remote, ByteArray(0)))
-                        finished = true
-                    }
-                    // A stream left over from an earlier, interrupted command: close it and move on.
-                    packet.command == AdbPacket.WRTE ->
-                        send(AdbPacket(AdbPacket.CLSE, packet.arg1, packet.arg0, ByteArray(0)))
-                }
-            }
-            text.toString().trim().also { socket?.soTimeout = READ_TIMEOUT_MS }
-        } catch (_: IOException) {
-            closeQuietly()
-            null
+        if (cancelled.get() || closed.get()) return null
+        require(readTimeoutMillis in 1..MAX_COMMAND_TIMEOUT_MS)
+        val result = exec(command, readTimeoutMillis) ?: return null
+        if (result.exit < 0) return null
+        return result.output?.trim()
+    }
+
+    /**
+     * One-shot command returning exit status and raw output. Unlike [shell] this also reports
+     * execution failures (exit = -1 with the error text in [RootResult.output]); it is null only
+     * when the assistant app did not answer.
+     */
+    @Synchronized
+    fun exec(command: String, timeoutMillis: Int): RootResult? {
+        if (cancelled.get() || closed.get()) return null
+        val bounded = timeoutMillis.coerceIn(1, MAX_COMMAND_TIMEOUT_MS)
+        val requestId = requestIds.incrementAndGet()
+        val result = Pending()
+        pending[requestId] = result
+        broadcast(ACTION_CP_CMD) { intent ->
+            intent.putExtra(EXTRA_REQUEST_ID, requestId)
+            intent.putExtra(EXTRA_COMMAND, command)
+            intent.putExtra(EXTRA_TIMEOUT_MS, bounded.toLong())
+        }
+        if (!awaitPending(result, requestId, bounded + RESULT_GRACE_MILLIS)) return null
+        return if (result.output != null) {
+            RootResult(result.exit, result.output)
+        } else {
+            RootResult(result.exit, result.error)
+        }
+    }
+
+    /**
+     * 请求小助手把车机媒体源切换到 [sourceId]（43=APPS，44=CarPlay）。仅投递不等待应答：
+     * 小助手 CpManager 收到后转发 MG_CHANGE_SOURCE_MANUAL 完成切换，其 RESULT 回执因无
+     * 对应 Pending 而被忽略。调用方通常用短期实例（`use`）发出即可。
+     */
+    fun requestSourceSwitch() {
+        broadcast(ACTION_CP_SWITCH_SOURCE) { intent ->
+            intent.putExtra(EXTRA_REQUEST_ID, requestIds.incrementAndGet())
         }
     }
 
     /** Exclusive interactive stream. Use a dedicated LocalAdb instance; never mix with [shell]. */
     @Synchronized
     fun openShell(command: String): InteractiveShell? {
-        if (cancelled.get()) return null
-        if (socket?.isClosed != false && connect(mayAsk = false) != Access.READY) return null
-        return try {
-            val local = nextStreamId++
-            send(AdbPacket(AdbPacket.OPEN, local, 0, "shell:$command\u0000".toByteArray()))
-            val reply = receive()
-            if (reply.command != AdbPacket.OKAY || reply.arg1 != local) throw IOException("interactive open rejected")
-            InteractiveShell(local, reply.arg0, ::send, ::receive,
-                { timeout -> socket?.soTimeout = timeout }, ::closeQuietly)
-        } catch (_: IOException) {
-            closeQuietly()
-            null
+        if (cancelled.get() || closed.get()) return null
+        val sessionId = requestIds.incrementAndGet()
+        val ack = Pending()
+        pending[sessionId] = ack
+        // 在等待 ACK 之前就注册 interactive：worker 可能在 ACK 之后立刻输出首行，
+        // 避免首行广播到达时 interactive 还是 null 而被丢弃。
+        val shell = InteractiveShell(sessionId, ::writeSession, ::closeSession)
+        interactive = shell
+        broadcast(ACTION_CP_SESSION_OPEN) { intent ->
+            intent.putExtra(EXTRA_SESSION, sessionId)
+            intent.putExtra(EXTRA_COMMAND, command)
         }
+        if (!awaitPending(ack, sessionId, ACK_TIMEOUT_MILLIS)) {
+            shell.close()
+            interactive = null
+            return null
+        }
+        if (!ack.ackOk) {
+            interactive = null
+            shell.close()
+            return null
+        }
+        return shell
     }
 
-    /** One request at a time, with strict stream ownership, byte/packet limits and a total deadline. */
+    /**
+     * One request at a time, with response size limits and a total deadline. Every output line
+     * arrives as a broadcast and is buffered in an instance queue; the request completes when the
+     * response text is exactly `done\n` (or ends with `\ndone\n`), as with the former ADB stream.
+     */
     class InteractiveShell internal constructor(
-        private val local: Int,
-        private val remote: Int,
-        private val sendPacket: (AdbPacket) -> Unit,
-        private val readPacket: () -> AdbPacket,
-        private val setTimeout: (Int) -> Unit,
-        private val closeConnection: () -> Unit,
+        internal val sessionId: Long,
+        private val write: (Long, String) -> Unit,
+        private val closeSession: (Long) -> Unit,
     ) : Closeable {
+        private val queue = LinkedBlockingQueue<StreamEvent>()
         @Volatile private var closed = false
-        private companion object {
-            val deadlines = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { runnable ->
-                Thread(runnable, "diplay-adb-stream-deadline").apply { isDaemon = true }
-            }
+
+        internal fun onLine(line: String) {
+            if (!closed && queue.size < MAX_QUEUED_LINES) queue.offer(StreamEvent(line, false))
         }
+
+        internal fun onClosed() {
+            if (closed) return
+            closed = true
+            queue.offer(StreamEvent("", true))
+        }
+
         @Synchronized
         fun exchangeBounded(request: String, timeoutMillis: Int = 5000): String? {
-            if (closed || request.toByteArray(Charsets.UTF_8).size > 1024 || '\n' in request || '\r' in request) return null
-            val boundedMillis = timeoutMillis.coerceIn(1, 10000)
-            // Socket read timeout alone restarts per read; an independent deadline also bounds drips.
-            val deadlineTask = deadlines.schedule({
-                closed = true
-                closeConnection()
-            }, boundedMillis.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
-            return try {
-                val deadline = System.nanoTime() + boundedMillis * 1_000_000L
-                sendPacket(AdbPacket(AdbPacket.WRTE, local, remote, "$request\n".toByteArray(Charsets.UTF_8)))
-                var acknowledged = false
-                val response = InteractiveResponseBuffer()
-                var packets = 0
-                while (!acknowledged || !response.complete) {
-                    if (++packets > 64) throw IOException("interactive packet limit")
-                    val remaining = (deadline - System.nanoTime()) / 1_000_000L
-                    if (remaining <= 0) throw SocketTimeoutException("interactive deadline")
-                    setTimeout(remaining.toInt().coerceAtLeast(1))
-                    val packet = readPacket()
-                    if (packet.arg0 != remote || packet.arg1 != local) throw IOException("wrong interactive stream")
-                    when (packet.command) {
-                        AdbPacket.OKAY -> acknowledged = true
-                        AdbPacket.WRTE -> {
-                            sendPacket(AdbPacket(AdbPacket.OKAY, local, remote, ByteArray(0)))
-                            response.accept(packet.payload)
-                        }
-                        AdbPacket.CLSE -> throw IOException("interactive stream ended")
-                        else -> throw IOException("unexpected interactive packet")
-                    }
+            if (closed || request.toByteArray(Charsets.UTF_8).size > 1024 ||
+                '\n' in request || '\r' in request
+            ) return null
+            val boundedMillis = timeoutMillis.coerceIn(1, 10_000)
+            write(sessionId, "$request\n")
+            val response = InteractiveResponseBuffer()
+            val deadline = System.nanoTime() + boundedMillis * 1_000_000L
+            while (!response.complete) {
+                val remainingMillis = (deadline - System.nanoTime()) / 1_000_000L
+                if (remainingMillis <= 0) {
+                    close()
+                    return null
                 }
-                response.text()
-            } catch (_: IOException) {
-                close()
-                null
-            } finally {
-                deadlineTask.cancel(false)
+                val event = queue.poll(remainingMillis, TimeUnit.MILLISECONDS) ?: run {
+                    close()
+                    return null
+                }
+                if (event.eof) {
+                    closed = true
+                    return null
+                }
+                try {
+                    response.accept((event.line + "\n").toByteArray(Charsets.UTF_8))
+                } catch (_: IOException) {
+                    close()
+                    return null
+                }
             }
+            return response.text()
         }
+
         @Synchronized
         override fun close() {
             if (closed) return
             closed = true
-            runCatching { sendPacket(AdbPacket(AdbPacket.CLSE, local, remote, ByteArray(0))) }
-            closeConnection()
+            runCatching { closeSession(sessionId) }
+            queue.offer(StreamEvent("", true))
         }
     }
 
     @Synchronized
-    override fun close() = closeQuietly()
+    override fun close() {
+        if (!closed.compareAndSet(false, true)) return
+        interactive?.close()
+        interactive = null
+        for (waiting in pending.values) waiting.latch.countDown()
+        pending.clear()
+        runCatching { appContext.unregisterReceiver(replyReceiver) }
+    }
 
-    /** Retires this client and unblocks pending I/O without waiting for its synchronized operation. */
+    /** Retires this client and unblocks pending waits without closing its broadcast receiver. */
     fun cancelPendingOperations() {
         cancelled.set(true)
-        runCatching { socket?.close() }
+        for (waiting in pending.values) waiting.latch.countDown()
     }
 
-    private fun handshake(mayAsk: Boolean): Access {
-        var packet = receive()
-        if (packet.command == AdbPacket.STLS) return Access.UNSUPPORTED
-        if (packet.command == AdbPacket.CNXN) return Access.READY
-        if (packet.command != AdbPacket.AUTH || packet.arg0 != AdbPacket.AUTH_TOKEN) return Access.UNREACHABLE
-        send(AdbPacket(AdbPacket.AUTH, AdbPacket.AUTH_SIGNATURE, 0, AdbKeys.sign(packet.payload, key.private)))
-        packet = receive()
-        if (packet.command == AdbPacket.CNXN) return Access.READY
-        if (!mayAsk) return Access.NOT_APPROVED
-        // adbd did not know the key: offer it, which opens the approval dialog on the car's screen.
-        send(AdbPacket(AdbPacket.AUTH, AdbPacket.AUTH_PUBLIC_KEY, 0, AdbKeys.publicKeyMessage(key.public)))
-        return awaitApproval()
+    // ---- 协议发送与应答缓存 ----
+
+    private fun broadcast(action: String, apply: (Intent) -> Unit) {
+        if (closed.get()) return
+        val intent = Intent(action).setPackage(PKG_ASSISTANT)
+        // replyTo 用调用方自己的包名：DiPlay 主 APK 与 legacy APK 共用本类，应答必须定向回到正确的请求方。
+        intent.putExtra(EXTRA_REPLY_TO, appContext.packageName)
+        apply(intent)
+        appContext.sendBroadcast(intent)
     }
 
-    private fun awaitApproval(): Access {
-        val pendingInput = input ?: throw IOException("not connected")
-        val deadline = System.nanoTime() + APPROVAL_TIMEOUT_MS * 1_000_000L
-        socket?.soTimeout = APPROVAL_RECHECK_MS
-        try {
-            while (System.nanoTime() < deadline) {
-                // 保留超时前收到的半包，静默检查后仍可继续解析原连接的响应。
-                pendingInput.mark(AdbPacket.MAX_PAYLOAD + 24)
-                try {
-                    val packet = receive()
-                    return if (packet.command == AdbPacket.CNXN) Access.READY else Access.NOT_APPROVED
-                } catch (_: SocketTimeoutException) {
-                    pendingInput.reset()
-                    // 部分车机保存了授权密钥，却不唤醒原连接；只用已保存的密钥检查，不再弹窗。
-                    val approved = LocalAdb(key, host, port).use { it.connect(mayAsk = false) == Access.READY }
-                    if (approved) {
-                        closeQuietly()
-                        return connect(mayAsk = false)
-                    }
-                }
-            }
-            return Access.NOT_APPROVED
-        } finally {
-            socket?.soTimeout = READ_TIMEOUT_MS
+    private fun writeSession(sessionId: Long, data: String) {
+        broadcast(ACTION_CP_SESSION_WRITE) { intent ->
+            intent.putExtra(EXTRA_SESSION, sessionId)
+            intent.putExtra(EXTRA_DATA, data)
         }
     }
 
-    private fun send(packet: AdbPacket) {
-        val out = output ?: throw IOException("not connected")
-        out.write(packet.encode())
-        out.flush()
+    private fun closeSession(sessionId: Long) {
+        interactive = null
+        broadcast(ACTION_CP_SESSION_CLOSE) { intent ->
+            intent.putExtra(EXTRA_SESSION, sessionId)
+        }
     }
 
-    private fun receive(): AdbPacket = AdbPacket.read(input ?: throw IOException("not connected"))
-
-    private fun closeQuietly() {
-        runCatching { socket?.close() }
-        socket = null
-        input = null
-        output = null
-        nextStreamId = 1
+    private inner class ReplyReceiver : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val received = intent ?: return
+            when (received.action) {
+                ACTION_CP_RESULT -> {
+                    val requestId = received.getLongExtra(EXTRA_REQUEST_ID, -1L)
+                    val waiting = pending.remove(requestId) ?: return
+                    if (received.hasExtra(EXTRA_CAPABILITY)) {
+                        waiting.capability = received.getStringExtra(EXTRA_CAPABILITY)
+                    } else {
+                        waiting.exit = received.getIntExtra(EXTRA_EXIT, -1)
+                        waiting.output = received.getStringExtra(EXTRA_OUTPUT)
+                        waiting.error = received.getStringExtra(EXTRA_ERROR)
+                    }
+                    waiting.latch.countDown()
+                }
+                ACTION_CP_SESSION_ACK -> {
+                    val sessionId = received.getLongExtra(EXTRA_SESSION, -1L)
+                    val waiting = pending.remove(sessionId) ?: return
+                    waiting.ackOk = received.getBooleanExtra(EXTRA_OK, false)
+                    waiting.error = received.getStringExtra(EXTRA_ERROR)
+                    waiting.latch.countDown()
+                }
+                ACTION_CP_SESSION_OUT -> {
+                    val sessionId = received.getLongExtra(EXTRA_SESSION, -1L)
+                    val shell = interactive ?: return
+                    if (shell.sessionId != sessionId) return
+                    if (received.getBooleanExtra(EXTRA_CLOSED, false)) {
+                        shell.onClosed()
+                    } else {
+                        shell.onLine(received.getStringExtra(EXTRA_LINE) ?: "")
+                    }
+                }
+            }
+        }
     }
+
+    private fun awaitPending(waiting: Pending, requestId: Long, timeoutMillis: Long): Boolean {
+        return try {
+            val answered = waiting.latch.await(timeoutMillis, TimeUnit.MILLISECONDS)
+            if (!answered) pending.remove(requestId)
+            answered
+        } catch (_: InterruptedException) {
+            pending.remove(requestId)
+            Thread.currentThread().interrupt()
+            false
+        }
+    }
+
+    private class Pending {
+        val latch = CountDownLatch(1)
+        @Volatile var capability: String? = null
+        @Volatile var exit = -1
+        @Volatile var output: String? = null
+        @Volatile var error: String? = null
+        @Volatile var ackOk = false
+    }
+
+    private class StreamEvent(val line: String, val eof: Boolean)
 
     private companion object {
-        const val CONNECT_TIMEOUT_MS = 2_000
+        const val PKG_ASSISTANT = "com.automanager"
+
+        const val ACTION_CP_CMD = "com.automanager.cp.CMD"
+        const val ACTION_CP_PROBE = "com.automanager.cp.PROBE"
+        const val ACTION_CP_SESSION_OPEN = "com.automanager.cp.SESSION_OPEN"
+        const val ACTION_CP_SESSION_WRITE = "com.automanager.cp.SESSION_WRITE"
+        const val ACTION_CP_SESSION_CLOSE = "com.automanager.cp.SESSION_CLOSE"
+        const val ACTION_CP_SWITCH_SOURCE = "com.automanager.cp.SWITCH_SOURCE"
+        const val ACTION_CP_RESULT = "com.automanager.cp.RESULT"
+        const val ACTION_CP_SESSION_ACK = "com.automanager.cp.SESSION_ACK"
+        const val ACTION_CP_SESSION_OUT = "com.automanager.cp.SESSION_OUT"
+
+        const val EXTRA_REQUEST_ID = "requestId"
+        const val EXTRA_REPLY_TO = "replyTo"
+        const val EXTRA_COMMAND = "command"
+        const val EXTRA_TIMEOUT_MS = "timeoutMs"
+        const val EXTRA_EXIT = "exit"
+        const val EXTRA_OUTPUT = "output"
+        const val EXTRA_ERROR = "error"
+        const val EXTRA_CAPABILITY = "capability"
+        const val EXTRA_SESSION = "session"
+        const val EXTRA_DATA = "data"
+        const val EXTRA_LINE = "line"
+        const val EXTRA_OK = "ok"
+        const val EXTRA_CLOSED = "closed"
+
+        const val CAP_ROOT = "root"
+
+        const val CONNECT_TIMEOUT_MS = 5_000L
+        const val READY_CACHE_MILLIS = 10_000L
+        const val RESULT_GRACE_MILLIS = 2_000L
+        const val ACK_TIMEOUT_MILLIS = 10_000L
         const val READ_TIMEOUT_MS = 5_000
-        const val APPROVAL_TIMEOUT_MS = 60_000
-        const val APPROVAL_RECHECK_MS = 1_000
         const val MAX_COMMAND_TIMEOUT_MS = 30_000
+        const val MAX_QUEUED_LINES = 2_000
     }
 }
 
-/** ADB payload boundaries need not coincide with UTF-8 characters or response lines. */
+/**
+ * The interactive response is complete when the accumulated text is exactly `done\n` or ends
+ * with `\ndone\n`, matching the former ADB stream contract. Design decision: this class is
+ * provided for historical parity; the broadcast bridge feeds it one whole line at a time.
+ */
 internal class InteractiveResponseBuffer {
     private val bytes = java.io.ByteArrayOutputStream()
     var complete = false

@@ -2,7 +2,6 @@ package com.shilapi.xcertplay
 
 import android.content.Context
 import android.provider.Settings
-import com.shilapi.xcertplay.adb.AdbKeys
 import com.shilapi.xcertplay.adb.LocalAdb
 import java.io.Closeable
 import java.util.concurrent.atomic.AtomicBoolean
@@ -33,7 +32,7 @@ internal object UsbPermissionSetup {
     }
 
     private class AdbClient(context: Context) : Client {
-        private val adb = LocalAdb(AdbKeys.load(context))
+        private val adb = LocalAdb(context)
         override fun connect() = adb.connect(mayAsk = true)
         override fun shell(command: String) = synchronized(accessibilityLock) { adb.shell(command) }
         override fun cancel() = adb.cancelPendingOperations()

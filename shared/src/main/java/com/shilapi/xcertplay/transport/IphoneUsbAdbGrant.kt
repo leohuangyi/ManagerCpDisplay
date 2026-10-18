@@ -7,7 +7,6 @@ import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.IBinder
 import android.os.Process
-import com.shilapi.xcertplay.adb.AdbKeys
 import com.shilapi.xcertplay.adb.LocalAdb
 import java.lang.reflect.InvocationTargetException
 import kotlin.system.exitProcess
@@ -35,7 +34,7 @@ internal object IphoneUsbAdbGrant {
         if (!supported()) return Result(Code.UNSUPPORTED)
         if (device.vendorId != IphoneUsbMatcher.APPLE_VENDOR_ID) return Result(Code.DENIED)
         val app = context.applicationContext
-        return LocalAdb(AdbKeys.load(app)).use { adb ->
+        return LocalAdb(app).use { adb ->
             // Never offer a new key here: a wired connection must not trigger an ADB approval prompt.
             if (adb.connect(mayAsk = false) != LocalAdb.Access.READY) return@use Result(Code.ADB_UNAVAILABLE)
             parse(

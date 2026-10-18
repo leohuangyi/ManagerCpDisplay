@@ -1,16 +1,11 @@
 package com.shilapi.xcertplay.hud
 
-import android.content.Context
-import com.shilapi.xcertplay.adb.LocalAdb
 import java.io.IOException
-import java.security.KeyPair
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
-import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
-import org.robolectric.util.ReflectionHelpers
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [32], manifest = Config.NONE)
@@ -68,32 +63,6 @@ class BydCallPopupChannelTest {
         BydCallPopupGuard.runSession(f.channel(), { false }, {}, {})
         assertEquals(listOf("STOP"), f.commands)
         assertEquals(3, f.mode)
-    }
-
-    @Test fun foregroundLossDuringStartKeepsTheConnectionForImmediateStop() {
-        val f = Fixture()
-        val guard = BydCallPopupGuard
-        val context: Context = RuntimeEnvironment.getApplication()
-        val owner = Any()
-        val client = LocalAdb(KeyPair(null, null))
-        ReflectionHelpers.setField(guard, "running", true)
-        try {
-            guard.update(context, owner, true) { true }
-            ReflectionHelpers.setField(guard, "adb", client)
-            f.afterStart = { guard.update(context, owner, false) { true } }
-            val generation = ReflectionHelpers.getField<Long>(guard, "generation")
-            guard.runPrepared(generation, f.channel())
-            assertFalse("Do not cancel the ADB connection between IGNORE and START acknowledgement",
-                ReflectionHelpers.getField<java.util.concurrent.atomic.AtomicBoolean>(client, "cancelled").get())
-            assertEquals(listOf("START", "STOP"), f.commands)
-            assertEquals(3, f.mode)
-        } finally {
-            guard.update(context, owner, false) { true }
-            ReflectionHelpers.setField(guard, "leased", false)
-            ReflectionHelpers.setField(guard, "adb", null)
-            ReflectionHelpers.setField(guard, "running", false)
-            client.close()
-        }
     }
 
     @Test fun malformedTerminalAcknowledgementIsRejected() {

@@ -1,7 +1,6 @@
 package com.shilapi.xcertplay
 
 import android.content.Context
-import com.shilapi.xcertplay.adb.AdbKeys
 import com.shilapi.xcertplay.adb.LocalAdb
 import java.io.File
 
@@ -71,7 +70,7 @@ internal object AdbClusterRouter {
             appendLine("calibrationOnly=${!holdStockMap}")
             appendLine("stockMapHoldMode=" + com.shilapi.xcertplay.hud.BydOutputSettings.oemClusterHold(context))
             try {
-                LocalAdb(AdbKeys.load(context)).use { adb ->
+                LocalAdb(context).use { adb ->
                     val access = adb.connect(mayAsk = false)
                     appendLine("adbAccess=$access")
                     if (access != LocalAdb.Access.READY) return@use
@@ -98,7 +97,7 @@ internal object AdbClusterRouter {
     }
 
     fun verify(context: Context, task: Int): Int? = runCatching {
-        LocalAdb(AdbKeys.load(context)).use { adb ->
+        LocalAdb(context).use { adb ->
             if (adb.connect(mayAsk = false) != LocalAdb.Access.READY) null
             else activityDisplay(adb.shell("dumpsys activity activities").orEmpty(), context.packageName, task)
         }

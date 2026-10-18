@@ -34,7 +34,7 @@ import org.robolectric.shadows.ShadowToast
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], qualifiers = "en", manifest = Config.NONE, shadows = [CarHotspotSwitchTest.Grant::class,
-    CarHotspotAdbGrantTest.WritePermission::class, CarHotspotSwitchTest.StatusCheck::class])
+    WritePermission::class, CarHotspotSwitchTest.StatusCheck::class])
 class CarHotspotSwitchTest {
     private lateinit var activity: DiPlayActivity
     private lateinit var controls: LinearLayout
@@ -46,7 +46,7 @@ class CarHotspotSwitchTest {
         }
         BydVehicleFieldStore.clearMemoryForTests()
         CarPlayBackgroundSession.clear()
-        CarHotspotAdbGrantTest.WritePermission.allowed = false
+        WritePermission.allowed = false
         ShadowSettings.setCanDrawOverlays(false)
         Grant.entered = CountDownLatch(1)
         Grant.release = CountDownLatch(1)
@@ -113,7 +113,7 @@ class CarHotspotSwitchTest {
     }
 
     @Test fun anExistingPermissionStillWaitsForAdbBeforeEnabling() {
-        CarHotspotAdbGrantTest.WritePermission.allowed = true
+        WritePermission.allowed = true
         hotspotSwitch().isChecked = true
         awaitGrant()
         assertFalse(CarHotspotSettings.enabled(activity))
@@ -144,7 +144,7 @@ class CarHotspotSwitchTest {
 
     @Test fun selectingBootLaterRequestsOnlyBootPermission() {
         CarHotspotSettings.setEnabled(activity, true)
-        CarHotspotAdbGrantTest.WritePermission.allowed = true
+        WritePermission.allowed = true
         bootSwitch().isChecked = true
         awaitGrant()
         assertFalse(AirPlayPersistence.loadAutoStartOnBoot(activity))
@@ -157,7 +157,7 @@ class CarHotspotSwitchTest {
 
     @Test fun aFailedBootGrantPreservesHotspotAndDoesNotEnableBootLaunch() {
         CarHotspotSettings.setEnabled(activity, true)
-        CarHotspotAdbGrantTest.WritePermission.allowed = true
+        WritePermission.allowed = true
         Grant.allowed = emptySet()
         bootSwitch().isChecked = true
         awaitGrant(); completeGrant()
@@ -167,7 +167,7 @@ class CarHotspotSwitchTest {
 
     @Test fun turningTheSwitchOffDoesNotRequestOrRevokePermissions() {
         CarHotspotSettings.setEnabled(activity, true)
-        CarHotspotAdbGrantTest.WritePermission.allowed = true
+        WritePermission.allowed = true
         refreshControls()
         hotspotSwitch().isChecked = false
         assertFalse(CarHotspotSettings.enabled(activity))
@@ -314,7 +314,7 @@ class CarHotspotSwitchTest {
                 for (permission in permissions) {
                     if (permission !in allowed) break
                     when (permission) {
-                        CarHotspotSetup.Permission.HOTSPOT -> CarHotspotAdbGrantTest.WritePermission.allowed = true
+                        CarHotspotSetup.Permission.HOTSPOT -> WritePermission.allowed = true
                         CarHotspotSetup.Permission.BOOT_LAUNCH -> ShadowSettings.setCanDrawOverlays(true)
                     }
                 }

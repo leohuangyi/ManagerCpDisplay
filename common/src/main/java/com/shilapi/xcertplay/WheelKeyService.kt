@@ -14,7 +14,6 @@ import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
 import android.widget.Toast
 import java.util.concurrent.atomic.AtomicBoolean
-import com.shilapi.xcertplay.adb.AdbKeys
 import com.shilapi.xcertplay.adb.LocalAdb
 import com.shilapi.xcertplay.telecom.PhoneAudioRoute
 import com.shilapi.xcertplay.airplay.AirPlayKnobState
@@ -431,7 +430,7 @@ class WheelKeyService : AccessibilityService() {
          * BYD's settings have no accessibility page, so the user can turn the service on through the car's
          * own adb (allowed once on the car screen). Services already in the list stay there.
          */
-        fun enableOverAdb(context: Context, mayAsk: Boolean = true): LocalAdb.Access = LocalAdb(AdbKeys.load(context)).use { adb ->
+        fun enableOverAdb(context: Context, mayAsk: Boolean = true): LocalAdb.Access = LocalAdb(context).use { adb ->
             val access = adb.connect(mayAsk)
             if (access != LocalAdb.Access.READY) return@use access
             if (!mayAsk && !needsRestore(context)) return@use if (connected()) access else LocalAdb.Access.UNREACHABLE

@@ -13,7 +13,7 @@ import java.net.NetworkInterface
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import kotlin.concurrent.thread
+import com.shilapi.xcertplay.adb.LocalAdb
 
 /**
  * Brings up the wireless link for CarPlay. Mirrors the reference implementation's three modes:
@@ -282,46 +282,12 @@ class LegacyNetwork(
         if (rc != 0) log("rmem_max raise failed rc=$rc out=${out.trim().take(120)}")
     }
 
+    /** Runs a rooted script in the assistant app, reached over broadcast (no local su anymore). */
     private fun runSu(script: String, timeoutSeconds: Long = 20): Pair<Int, String> {
-        val process = try {
-            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
-        } catch (e: Exception) {
-            return -1 to (e.message ?: "su unavailable")
+        val result = LocalAdb(context.applicationContext).use {
+            it.exec(script, (timeoutSeconds * 1000).toInt().coerceIn(1, 30_000))
         }
-        val output = StringBuilder()
-        val reader = thread(start = true, isDaemon = true) {
-            process.inputStream.bufferedReader().useLines { lines ->
-                lines.forEach { output.append(it).append('\n') }
-            }
-        }
-        // Process.waitFor(long, TimeUnit) needs API 26; poll exitValue() instead for API 17.
-        val deadline = System.currentTimeMillis() + timeoutSeconds * 1000
-        var exitValue = -1
-        var finished = false
-        while (!finished) {
-            try {
-                exitValue = process.exitValue()
-                finished = true
-            } catch (_: IllegalThreadStateException) {
-                val remaining = deadline - System.currentTimeMillis()
-                if (remaining <= 0) {
-                    runCatching { process.destroy() }
-                    return -1 to "timed out"
-                }
-                try {
-                    Thread.sleep(if (remaining < 100) remaining else 100)
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    break
-                }
-            }
-        }
-        try {
-            reader.join(1000)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-        }
-        return process.exitValue() to output.toString()
+        return result?.let { it.exit to it.output.orEmpty() } ?: (-1 to "cp unavailable")
     }
 
     // --- Hotspot via setWifiApEnabled reflection (app / saved) -----------------------------

@@ -1,7 +1,6 @@
 package com.shilapi.xcertplay.hud
 
 import android.content.Context
-import com.shilapi.xcertplay.adb.AdbKeys
 import com.shilapi.xcertplay.adb.LocalAdb
 
 /**
@@ -20,7 +19,7 @@ object BydBootStartRepair {
     /** Blocking, with the car allowed to show its ADB key approval dialog. Off the main thread. */
     fun apply(context: Context, packageName: String): Result {
         val lines = mutableListOf<String>()
-        LocalAdb(AdbKeys.load(context)).use { adb ->
+        LocalAdb(context).use { adb ->
             when (adb.connect(mayAsk = true)) {
                 LocalAdb.Access.READY -> Unit
                 LocalAdb.Access.NOT_APPROVED -> return Result(listOf("ADB not approved"))

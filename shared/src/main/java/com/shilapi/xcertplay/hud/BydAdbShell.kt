@@ -3,7 +3,6 @@ package com.shilapi.xcertplay.hud
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
-import com.shilapi.xcertplay.adb.AdbKeys
 import com.shilapi.xcertplay.adb.LocalAdb
 
 /**
@@ -27,7 +26,7 @@ internal class BydAdbShell(private val tag: String) {
     fun run(context: Context, command: String, readTimeoutMillis: Int?): String? {
         val now = SystemClock.elapsedRealtime()
         if (now < retryAtMillis) return null
-        val client = adb ?: LocalAdb(AdbKeys.load(context)).also { adb = it }
+        val client = adb ?: LocalAdb(context).also { adb = it }
         val access = client.connect(mayAsk = false)
         lastAccess = access
         if (access != LocalAdb.Access.READY) {

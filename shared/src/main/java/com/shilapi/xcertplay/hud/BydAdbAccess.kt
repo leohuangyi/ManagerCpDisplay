@@ -1,7 +1,6 @@
 package com.shilapi.xcertplay.hud
 
 import android.content.Context
-import com.shilapi.xcertplay.adb.AdbKeys
 import com.shilapi.xcertplay.adb.LocalAdb
 import com.shilapi.xcertplay.transport.VehicleGear
 
@@ -21,7 +20,7 @@ object BydAdbAccess {
 
     /** Blocking: run off the main thread. [mayAsk] lets the car show its approval dialog for DiPlay's key. */
     fun check(context: Context, mayAsk: Boolean): Status {
-        LocalAdb(AdbKeys.load(context)).use { adb ->
+        LocalAdb(context).use { adb ->
             val state = state(adb.connect(mayAsk))
             if (state != State.READY) return Status(state)
             return readStatus(context, adb::shell)
@@ -30,7 +29,7 @@ object BydAdbAccess {
 
     /** ADB handshake only; does not read any BYD service or offer feature conclusions. */
     fun checkState(context: Context, mayAsk: Boolean): State =
-        LocalAdb(AdbKeys.load(context)).use { state(it.connect(mayAsk)) }
+        LocalAdb(context).use { state(it.connect(mayAsk)) }
 
     internal fun state(access: LocalAdb.Access): State = when (access) {
         LocalAdb.Access.READY -> State.READY

@@ -2,7 +2,6 @@ package com.shilapi.xcertplay.hud
 
 import android.content.Context
 import android.os.Build
-import com.shilapi.xcertplay.adb.AdbKeys
 import com.shilapi.xcertplay.adb.LocalAdb
 
 data class BydVehicleProbeOutcome(
@@ -17,7 +16,7 @@ object BydVehicleCapabilityProbe {
     @Synchronized
     fun probe(context: Context, persist: Boolean = true): BydVehicleProbeOutcome {
         val app = context.applicationContext
-        LocalAdb(AdbKeys.load(app)).use { adb ->
+        LocalAdb(app).use { adb ->
             val access = BydAdbAccess.state(adb.connect(mayAsk = false))
             if (access != BydAdbAccess.State.READY) return BydVehicleProbeOutcome(access)
 

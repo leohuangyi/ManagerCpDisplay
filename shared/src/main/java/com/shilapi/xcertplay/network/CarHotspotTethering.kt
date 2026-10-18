@@ -5,7 +5,6 @@ import android.net.ConnectivityManager
 import android.os.Bundle
 import android.os.ResultReceiver
 import android.provider.Settings
-import com.shilapi.xcertplay.adb.AdbKeys
 import com.shilapi.xcertplay.adb.LocalAdb
 import java.lang.reflect.InvocationTargetException
 import java.util.concurrent.atomic.AtomicInteger
@@ -56,7 +55,7 @@ object CarHotspotTethering {
             val client = AtomicReference<LocalAdb?>()
             CarHotspotAdbFallback.bounded(deadline, isCancelled,
                 abort = { client.get()?.cancelPendingOperations() }) {
-                val adb = LocalAdb(AdbKeys.load(context))
+                val adb = LocalAdb(context)
                 client.set(adb)
                 adb.use {
                     val access = if (isCancelled() || Thread.currentThread().isInterrupted || System.nanoTime() >= deadline) null

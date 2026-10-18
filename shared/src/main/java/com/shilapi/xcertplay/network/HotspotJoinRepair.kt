@@ -1,7 +1,6 @@
 package com.shilapi.xcertplay.network
 
 import android.content.Context
-import com.shilapi.xcertplay.adb.AdbKeys
 import com.shilapi.xcertplay.adb.LocalAdb
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
@@ -27,7 +26,7 @@ class HotspotJoinRepair {
             app = application
             val operation = UUID.randomUUID().toString()
             request = operation
-            val client = LocalAdb(AdbKeys.load(application)).also { adb = it }
+            val client = LocalAdb(application).also { adb = it }
             client.use {
                 when (it.connect(mayAsk = action == Action.CHECK)) {
                     LocalAdb.Access.NOT_APPROVED -> return Result(Code.NOT_APPROVED)
@@ -52,7 +51,7 @@ class HotspotJoinRepair {
         adb?.cancelPendingOperations()
         if (operation != null && application != null) Thread({
             runCatching {
-                LocalAdb(AdbKeys.load(application)).use {
+                LocalAdb(application).use {
                     if (it.connect(mayAsk = false) == LocalAdb.Access.READY)
                         it.shell(command(application.packageCodePath, application.packageName, "cancel", operation, null))
                 }

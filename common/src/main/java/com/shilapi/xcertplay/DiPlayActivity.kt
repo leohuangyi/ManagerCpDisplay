@@ -5310,7 +5310,7 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
         val app = applicationContext
         Thread({
             val result = runCatching {
-                com.shilapi.xcertplay.adb.LocalAdb(com.shilapi.xcertplay.adb.AdbKeys.load(app)).use {
+                com.shilapi.xcertplay.adb.LocalAdb(app).use {
                     it.connect(mayAsk = true)
                 }
             }.getOrNull()

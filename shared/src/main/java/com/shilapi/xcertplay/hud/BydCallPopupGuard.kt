@@ -2,7 +2,6 @@ package com.shilapi.xcertplay.hud
 
 import android.content.Context
 import android.os.Build
-import com.shilapi.xcertplay.adb.AdbKeys
 import com.shilapi.xcertplay.adb.LocalAdb
 import java.io.Closeable
 import java.io.IOException
@@ -59,7 +58,7 @@ object BydCallPopupGuard {
             val (value, context) = selected
             try {
                 if (Build.VERSION.SDK_INT != 32) { status = "UNSUPPORTED"; continue }
-                val client = LocalAdb(AdbKeys.load(context))
+                val client = LocalAdb(context)
                 client.use {
                     synchronized(gate) {
                         if (!current(value)) return@use
