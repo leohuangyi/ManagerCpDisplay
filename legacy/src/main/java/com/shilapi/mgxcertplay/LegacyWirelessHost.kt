@@ -375,6 +375,21 @@ object LegacyWirelessHost {
             current?.close()
         } catch (_: Throwable) {
         }
+        // Final exit (not the in-process wireless restart, which rebuilds the hotspot itself
+        // through prepareAuto): after the teardown above the head unit has no AP, a cleared
+        // wlan0 and stopped mdnsd, so restore the hotspot over the su broadcast channel in the
+        // background. Must run after close(): close() tears the hotspot down, and the restore
+        // would otherwise be killed right away. A daemon thread keeps it off the main thread,
+        // since the restore pays several su round-trips that can take tens of seconds.
+        if (!restartingWireless && current != null) {
+            Thread({
+                runCatching { current.restoreHotspotAfterCarPlay() }
+                    .onFailure { Log.w(TAG, "Hotspot restore after CarPlay exit failed", it) }
+            }, "legacy-hotspot-restore").apply {
+                isDaemon = true
+                start()
+            }
+        }
     }
 
     private fun findPhone(): BluetoothDevice? {

@@ -91,6 +91,9 @@ class LegacyWirelessController(
 
     private val closed = AtomicBoolean(false)
     private val resources = CopyOnWriteArrayList<Closeable>()
+
+    /** The network handle of the running bootstrap, kept for the post-CarPlay hotspot restore. */
+    @Volatile private var network: LegacyNetwork? = null
     private val wakeLocks = CopyOnWriteArrayList<PowerManager.WakeLock>()
     private val wifiLocks = CopyOnWriteArrayList<WifiManager.WifiLock>()
     @Volatile private var multicastLock: WifiManager.MulticastLock? = null
@@ -257,7 +260,8 @@ class LegacyWirelessController(
         // RFCOMM channel. They now run on three parallel tracks and meet at a latch; a failure
         // on any track aborts the bootstrap without waiting for the others. The latch gives
         // the join the visibility a plain volatile read could not guarantee on every JVM.
-        val network = LegacyNetwork(context, networkMode, { closed.get() }, log).also { resources += it }
+        val network = LegacyNetwork(context, networkMode, { closed.get() }, log)
+            .also { this.network = it; resources += it }
         var endpoint: LegacyNetwork.Endpoint? = null
         var parts: SessionParts? = null
         val failures = CopyOnWriteArrayList<Throwable>()
@@ -709,6 +713,15 @@ class LegacyWirelessController(
         wifiLocks.clear()
         resources.forEach { runCatching { it.close() } }
         resources.clear()
+    }
+
+    /**
+     * Restores the head unit's hotspot and network access after a CarPlay session ended and
+     * the controller is being torn down. Only meaningful in `auto` network mode and only when
+     * this controller brought the hotspot up itself; otherwise it is a no-op.
+     */
+    fun restoreHotspotAfterCarPlay() {
+        network?.restoreAfterCarPlay()
     }
 
     private fun encode64(bytes: ByteArray): String = Base64.encodeToString(bytes, Base64.NO_WRAP)

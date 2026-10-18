@@ -464,6 +464,22 @@ class LegacyNetwork(
         }
     }
 
+    /**
+     * Re-brings the hotspot up after CarPlay ended and [close] tore it down (final app exit,
+     * not an in-process wireless restart): the head unit would otherwise be left with no AP,
+     * wlan0 cleared and mdnsd stopped. The restore goes through the same su broadcast channel
+     * as the boot path (LocalAdb -> assistant CpManager) and additionally restarts mdnsd so
+     * the head unit regains network access. The single-radio constraint forbids a parallel
+     * `svc wifi enable`, which would fight hostapd over wlan0.
+     */
+    fun restoreAfterCarPlay(): Boolean {
+        if (!hotspotStartedByUs) return false
+        val (ssid, password, channel) = hotspotProfile()
+        val (rc, out) = runSu(hotspotUpScript(ssid, password, channel) + " && setprop ctl.start mdnsd", timeoutSeconds = 25)
+        log("Hotspot restore rc=$rc out=${out.trim().take(300)}")
+        return rc == 0 && isHostapdAlive() && isDnsmasqAlive()
+    }
+
     private companion object {
         const val AP_STATE_ENABLED = 13
 
