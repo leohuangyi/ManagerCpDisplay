@@ -1,4 +1,4 @@
-package local.airuize.diplaylegacy
+package com.shilapi.mgxcertplay
 
 import android.content.Context
 import android.net.wifi.WifiConfiguration

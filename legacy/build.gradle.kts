@@ -5,13 +5,13 @@ plugins {
 // Minimal API 17 (Android 4.2.2) port of DiPlay: reuses the `shared` protocol/media core,
 // drops the Compose `common` UI layer, and drives CarPlay through a native SurfaceView.
 android {
-    namespace = "local.airuize.diplaylegacy"
+    namespace = "com.shilapi.mgxcertplay"
     compileSdk {
         version = release(37)
     }
 
     defaultConfig {
-        applicationId = "local.airuize.diplaylegacy"
+        applicationId = "com.shilapi.mgxcertplay"
         minSdk = 17
         targetSdk = 18
         versionCode = 1

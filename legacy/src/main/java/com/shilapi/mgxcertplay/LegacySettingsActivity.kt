@@ -1,4 +1,4 @@
-package local.airuize.diplaylegacy
+package com.shilapi.mgxcertplay
 
 import android.app.Activity
 import android.app.AlertDialog

@@ -1,4 +1,4 @@
-package local.airuize.diplaylegacy
+package com.shilapi.mgxcertplay
 
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter

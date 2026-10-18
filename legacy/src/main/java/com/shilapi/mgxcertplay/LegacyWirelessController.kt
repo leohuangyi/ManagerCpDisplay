@@ -1,4 +1,4 @@
-package local.airuize.diplaylegacy
+package com.shilapi.mgxcertplay
 
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
