@@ -5,6 +5,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import java.io.Closeable
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
@@ -56,11 +58,17 @@ class LocalAdb(context: Context) : Closeable {
             addAction(ACTION_CP_SESSION_ACK)
             addAction(ACTION_CP_SESSION_OUT)
         }
+        // The reply receiver must never run on the main looper: exec/connect await their
+        // answers with a CountDownLatch, and a caller doing that on the main thread would
+        // otherwise block the very thread the reply needs, ANRing after the timeout. The
+        // looper is shared process-wide so short-lived `use { }` clients do not spawn one
+        // thread per command.
+        val scheduler = Handler(replyLooper())
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             // 必须显式 exported：广播来自小助手进程。
-            appContext.registerReceiver(replyReceiver, filter, Context.RECEIVER_EXPORTED)
+            appContext.registerReceiver(replyReceiver, filter, null, scheduler, Context.RECEIVER_EXPORTED)
         } else {
-            appContext.registerReceiver(replyReceiver, filter)
+            appContext.registerReceiver(replyReceiver, filter, null, scheduler)
         }
     }
 
@@ -348,6 +356,46 @@ class LocalAdb(context: Context) : Closeable {
     private class StreamEvent(val line: String, val eof: Boolean)
 
     private companion object {
+        /** Lazily started, process-wide looper for reply broadcasts; daemon so it never blocks process death. */
+        @Volatile
+        private var replyLooperInstance: Looper? = null
+
+        fun replyLooper(): Looper {
+            replyLooperInstance?.let { return it }
+            return synchronized(this) {
+                replyLooperInstance?.let { return it }
+                var built: Looper? = null
+                val lock = Object()
+                val thread = object : Thread() {
+                    override fun run() {
+                        Looper.prepare()
+                        synchronized(lock) {
+                            built = Looper.myLooper()
+                            lock.notifyAll()
+                        }
+                        Looper.loop()
+                    }
+                }.apply {
+                    name = "xcertplay-adb-replies"
+                    isDaemon = true
+                }
+                thread.start()
+                synchronized(lock) {
+                    while (built == null) {
+                        try {
+                            lock.wait()
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            break
+                        }
+                    }
+                }
+                val result = checkNotNull(built) { "reply looper failed to start" }
+                replyLooperInstance = result
+                result
+            }
+        }
+
         const val PKG_ASSISTANT = "com.automanager"
 
         const val ACTION_CP_CMD = "com.automanager.cp.CMD"

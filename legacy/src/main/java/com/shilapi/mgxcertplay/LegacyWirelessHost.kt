@@ -338,12 +338,22 @@ object LegacyWirelessHost {
         if (action == null) { Log.w(TAG, "restartWireless abort: no restarter"); return }
         val target = currentSurface
         if (target == null) { Log.w(TAG, "restartWireless abort: no surface"); return }
-        // shutdown() closes the engine, whose teardown edges must not re-arm the stall
-        // watchdog for the boot that is about to replace the dead one.
+        if (restartingWireless) { Log.i(TAG, "restartWireless: rebuild already in flight"); return }
+        // All callers (resume/stall watchdogs, onSessionEnded) arrive on the main thread.
+        // shutdown() closes the engine synchronously, and for a hotspot we started that ends
+        // in an su round-trip whose reply broadcast is delivered back on the main looper -
+        // blocking the main thread here would starve that delivery until the wait times out
+        // (~20 s) and ANR the activity. Run the rebuild off the main thread instead; the flag
+        // marks the window so the stall watchdog cannot arm mid-rebuild.
         restartingWireless = true
-        shutdown()
-        Log.i(TAG, "restartWireless: invoking restarter with surface")
-        action(target)
+        Thread({
+            shutdown()
+            Log.i(TAG, "restartWireless: invoking restarter with surface")
+            action(target)
+        }, "legacy-wireless-restart").apply {
+            isDaemon = true
+            start()
+        }
     }
 
     /**
