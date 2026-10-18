@@ -10,3 +10,7 @@
 #-keepclassmembers class fqcn.of.javascript.interface.for.webview {
 #   public *;
 #}
+
+# jmdns 通过 Class.forName 反射加载 javax.jmdns.impl 下的实现类
+# （NetworkTopologyDiscovery / JmmDNS 工厂），混淆或裁剪会导致 mDNS 发现失败。
+-keep class javax.jmdns.** { *; }

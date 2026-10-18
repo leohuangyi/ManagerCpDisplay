@@ -1,0 +1,6 @@
+# DiPlay legacy (Android 4.2.2 移植版) 的 R8 keep 规则。
+# AGP 9.3 会自动合并 src/main/keepRules 下所有 .keep 文件传给 R8。
+
+# jmdns 通过 Class.forName 反射加载 javax.jmdns.impl 下的实现类
+# （NetworkTopologyDiscovery / JmmDNS 工厂），混淆或裁剪会导致 mDNS 发现失败。
+-keep class javax.jmdns.** { *; }
