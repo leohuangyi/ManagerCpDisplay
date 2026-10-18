@@ -183,7 +183,7 @@ class LegacyNetwork(
         // the rmem_max raise. Three separate su spawns cost about a second each on this unit.
         val (prepRc, prepOut) = runSu(SU_HOTSPOT_PREP, timeoutSeconds = 8)
         if (prepRc != 0 || !prepOut.contains("uid=0")) {
-            throw IllegalStateException("Hotspot automation needs root: grant su once over USB adb")
+            throw IllegalStateException("Hotspot automation needs root")
         }
         val (ssid, password, channel) = parseAndCacheHotspotProfile(prepOut)
 

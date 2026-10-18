@@ -191,7 +191,7 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
         })
 
         val title = TextView(this).apply {
-            text = "DiPlay"
+            text = "MgCarPlay"
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 34f)
             typeface = Typeface.DEFAULT_BOLD
