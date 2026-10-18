@@ -8,7 +8,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [32], manifest = Config.NONE)
+@Config(sdk = [29, 32], manifest = Config.NONE)
 class BydCallPopupChannelTest {
     private class Fixture : BydCallPopupLease.Ops {
         var mode = 3

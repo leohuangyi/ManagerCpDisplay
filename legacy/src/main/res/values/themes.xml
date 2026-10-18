@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <style name="LegacyTheme" parent="@android:style/Theme.Black.NoTitleBar.Fullscreen">
-        <item name="android:windowBackground">@android:color/black</item>
+        <!-- Centered "Loading…" art on black: the launcher preview window shows it
+             immediately at cold start, before the activity's first frame. -->
+        <item name="android:windowBackground">@drawable/splash_window_background</item>
+        <item name="android:windowDisablePreview">false</item>
     </style>
 </resources>

@@ -103,12 +103,26 @@ class LocalAdb(context: Context) : Closeable {
     }
 
     /**
+     * Upstream one-shot write path compatibility: [stdin] is forwarded to the assistant app
+     * together with the command (EXTRA_STDIN), to be fed to the command's stdin once CpManager
+     * consumes it. Keeps the newly merged upstream hotspot-config writer compiling.
+     */
+    @Synchronized
+    fun shell(command: String, readTimeoutMillis: Int, stdin: ByteArray?): String? {
+        if (cancelled.get() || closed.get()) return null
+        require(readTimeoutMillis in 1..MAX_COMMAND_TIMEOUT_MS)
+        val result = exec(command, readTimeoutMillis, stdin) ?: return null
+        if (result.exit < 0) return null
+        return result.output?.trim()
+    }
+
+    /**
      * One-shot command returning exit status and raw output. Unlike [shell] this also reports
      * execution failures (exit = -1 with the error text in [RootResult.output]); it is null only
      * when the assistant app did not answer.
      */
     @Synchronized
-    fun exec(command: String, timeoutMillis: Int): RootResult? {
+    fun exec(command: String, timeoutMillis: Int, stdin: ByteArray? = null): RootResult? {
         if (cancelled.get() || closed.get()) return null
         val bounded = timeoutMillis.coerceIn(1, MAX_COMMAND_TIMEOUT_MS)
         val requestId = requestIds.incrementAndGet()
@@ -118,6 +132,7 @@ class LocalAdb(context: Context) : Closeable {
             intent.putExtra(EXTRA_REQUEST_ID, requestId)
             intent.putExtra(EXTRA_COMMAND, command)
             intent.putExtra(EXTRA_TIMEOUT_MS, bounded.toLong())
+            if (stdin != null) intent.putExtra(EXTRA_STDIN, stdin)
         }
         if (!awaitPending(result, requestId, bounded + RESULT_GRACE_MILLIS)) return null
         return if (result.output != null) {
@@ -349,6 +364,7 @@ class LocalAdb(context: Context) : Closeable {
         const val EXTRA_REPLY_TO = "replyTo"
         const val EXTRA_COMMAND = "command"
         const val EXTRA_TIMEOUT_MS = "timeoutMs"
+        const val EXTRA_STDIN = "stdin"
         const val EXTRA_EXIT = "exit"
         const val EXTRA_OUTPUT = "output"
         const val EXTRA_ERROR = "error"

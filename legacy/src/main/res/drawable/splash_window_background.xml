@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Splash shown by the preview window before the first frame: centered
+     "Loading…" art on the theme's black background. The real splash card
+     renders on top of it later, so the transition is seamless. -->
+<bitmap xmlns:android="http://schemas.android.com/apk/res/android"
+    android:src="@drawable/splash_loading"
+    android:gravity="center" />
