@@ -152,6 +152,8 @@ class CarPlayHostActivity : ComponentActivity() {
     private var startupRetryStopped = false
     private var startupRetryButton: View? = null
     private var startupFailureGeneration = -1
+    private var carPlaySourceSwitchGeneration = -1
+    private var carPlaySourceSwitchSent = false
     private lateinit var airPlayIdentity: AirPlayIdentity
     private var languagePreferenceAtCreate = AppLocale.SYSTEM
 
@@ -5056,9 +5058,14 @@ class CarPlayHostActivity : ComponentActivity() {
         controllerGeneration: Int,
     ): (CarPlayStatus) -> Unit = report@{ status ->
         if (controllerGeneration != restartGeneration) return@report
+        if (carPlaySourceSwitchGeneration != controllerGeneration) {
+            carPlaySourceSwitchGeneration = controllerGeneration
+            carPlaySourceSwitchSent = false
+        }
         if (status is CarPlayStatus.Failed || status is CarPlayStatus.ControlEnded) {
             callPopupSessionReady = false
             updateCallPopupGuard()
+            carPlaySourceSwitchSent = false
         }
         if (menuOpen) {
             if (status is CarPlayStatus.Failed) failurePendingAfterMenu = status
@@ -5072,6 +5079,7 @@ class CarPlayHostActivity : ComponentActivity() {
         // Only a working AirPlay session, or a new failure, replaces it.
         if (status is CarPlayStatus.Failed) showConnectionHelp(status)
         when (status) {
+            is CarPlayStatus.RunningControl -> maybeSwitchMediaSourceToCarPlay()
             is CarPlayStatus.Failed -> if (status.wifiResetRequired) {
                 wifiRecoveryButton?.visibility = View.VISIBLE
             } else {
@@ -5084,6 +5092,16 @@ class CarPlayHostActivity : ComponentActivity() {
             }
             else -> Unit
         }
+    }
+
+    /**
+     * CarPlay 控制会话刚建立（iAP2 runtime control running）时，请求小助手把车机媒体源
+     * 切到 CarPlay，让音频立即从 CarPlay 侧出来。每次会话只请求一次，会话结束/失败后复位。
+     */
+    private fun maybeSwitchMediaSourceToCarPlay() {
+        if (carPlaySourceSwitchSent) return
+        carPlaySourceSwitchSent = true
+        LocalAdb(this).use { it.requestSourceSwitch() }
     }
 
     private fun adoptBackgroundSession(): Boolean {
