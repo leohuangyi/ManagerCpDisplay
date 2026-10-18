@@ -5388,6 +5388,7 @@ class CarPlayHostActivity : ComponentActivity() {
         if (status is CarPlayStatus.Failed) showConnectionHelp(status)
         when (status) {
             is CarPlayStatus.RunningControl -> maybeSwitchMediaSourceToCarPlay()
+            is CarPlayStatus.RunningWireless -> maybeSwitchMediaSourceToCarPlay()
             is CarPlayStatus.Failed -> if (status.wifiResetRequired) {
                 wifiRecoveryButton?.visibility = View.VISIBLE
             } else {
@@ -5403,8 +5404,8 @@ class CarPlayHostActivity : ComponentActivity() {
     }
 
     /**
-     * CarPlay 控制会话刚建立（iAP2 runtime control running）时，请求小助手把车机媒体源
-     * 切到 CarPlay，让音频立即从 CarPlay 侧出来。每次会话只请求一次，会话结束/失败后复位。
+     * CarPlay 控制会话刚建立（有线 RunningControl 或无线 RunningWireless）时，请求小助手把车机媒体源
+     * 切到蓝牙（小助手侧固定切 sourceId=19）。每次会话只请求一次，会话结束/失败后复位。
      */
     private fun maybeSwitchMediaSourceToCarPlay() {
         if (carPlaySourceSwitchSent) return

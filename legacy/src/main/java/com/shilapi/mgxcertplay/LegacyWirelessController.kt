@@ -10,6 +10,7 @@ import android.net.wifi.WifiManager
 import android.os.PowerManager
 import android.util.Base64
 import android.util.Log
+import com.shilapi.xcertplay.adb.LocalAdb
 import com.shilapi.xcertplay.airplay.AirPlayConfig
 import com.shilapi.xcertplay.airplay.AirPlayContact
 import com.shilapi.xcertplay.airplay.AirPlayDisplayConfig
@@ -100,6 +101,8 @@ class LegacyWirelessController(
         override fun onSessionActive(session: AirPlaySession) {
             activeSession = session
             log("AirPlay session active; waiting for video")
+            // CarPlay 控制会话建立后，请求小助手切到蓝牙媒体源(19)，让音频从蓝牙侧出来。每次新会话重新请求一次。
+            LocalAdb(context).use { it.requestSourceSwitch() }
         }
 
         override fun onSessionEnded(session: AirPlaySession) {
