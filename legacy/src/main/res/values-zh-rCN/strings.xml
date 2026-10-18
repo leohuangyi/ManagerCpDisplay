@@ -35,6 +35,9 @@
     <string name="prompt_hint">点击下方按钮开始连接 iPhone</string>
     <string name="prompt_button">开始连接</string>
 
+    <!-- Back key exit confirmation -->
+    <string name="exit_double_press_hint">再按一次返回键将断开连接并返回主界面</string>
+
     <!-- Settings screen -->
     <string name="caption_connection">连接</string>
     <string name="setting_autoconnect">打开即连接</string>

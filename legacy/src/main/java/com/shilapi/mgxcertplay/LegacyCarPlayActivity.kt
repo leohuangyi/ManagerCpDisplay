@@ -17,6 +17,7 @@ import android.provider.Settings
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -29,6 +30,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import android.widget.Toast
 
 /**
  * Minimal API 17 host screen. Holds the CarPlay video SurfaceView, shows a branded loading
@@ -44,6 +46,9 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
         private const val STAGE_IPHONE = 2
         private const val STAGE_CARPLAY = 3
         private const val STAGE_SCREEN = 4
+
+        /** Window in which a second back press counts as the deliberate exit. */
+        private const val BACK_EXIT_WINDOW_MS = 2000L
 
         private const val COLOR_PENDING = 0xFF546E7A.toInt()
         private const val COLOR_LABEL = 0xFF90A4AE.toInt()
@@ -118,6 +123,8 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
     private var boundSurface: Surface? = null
     /** Monotonic clock when the activity was created; logged when the first frame arrives. */
     private var coldStartAt = 0L
+    /** Uptime of the last back press, for the double-press-to-exit guard. */
+    private var lastBackPressAt = 0L
 
     // -- lifecycle -------------------------------------------------------------------
 
@@ -658,6 +665,26 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
             isDaemon = true
             start()
         }
+    }
+
+    /**
+     * A single back press would silently drop the CarPlay session, so guard it with a
+     * double-press window: the first press only shows a hint, a second press inside
+     * [BACK_EXIT_WINDOW_MS] finishes the activity. onDestroy then shuts the host down,
+     * which also restores the head unit hotspot and network access.
+     */
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_BACK && event.repeatCount == 0) {
+            val now = SystemClock.uptimeMillis()
+            if (now - lastBackPressAt <= BACK_EXIT_WINDOW_MS) {
+                finish()
+            } else {
+                lastBackPressAt = now
+                Toast.makeText(this, R.string.exit_double_press_hint, Toast.LENGTH_SHORT).show()
+            }
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
