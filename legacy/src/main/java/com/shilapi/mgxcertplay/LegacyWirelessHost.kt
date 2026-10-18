@@ -13,6 +13,26 @@ import com.shilapi.xcertplay.media.AndroidMediaSink
 import com.shilapi.xcertplay.media.CarPlayTouchMapper
 
 /**
+ * Locale-independent status codes the host reports while booting the wireless link. The
+ * activity maps each code to the locale string so the log-milestone matching stays stable
+ * across translations.
+ */
+enum class HostStatus {
+    PREPARING,
+    HOTSPOT_READY,
+    WAITING_IPHONE,
+    IPHONE_CONNECTED,
+    CARPLAY_READY,
+    STARTING_SCREEN,
+    RECONNECT_WAIT,
+    NO_PAIRED,
+    CONNECTION_FAILED,
+}
+
+/** A [HostStatus] plus an optional detail (usually the failure reason). */
+class StatusUpdate(val status: HostStatus, val detail: String? = null)
+
+/**
  * API 17 entry point for the wireless CarPlay stack. Builds the media sink and [LegacyWirelessController]
  * and forwards touch. The wired host ([LegacyCarPlayHost]) is left intact.
  */
@@ -100,7 +120,7 @@ object LegacyWirelessHost {
         height: Int,
         log: (String) -> Unit = { Log.i(TAG, it) },
         /** Short user-facing progress label, called from background threads. */
-        onStatus: (String) -> Unit = {},
+        onStatus: (StatusUpdate) -> Unit = {},
         /** Progress checks for the loading screen: 1 = hotspot ready, 2 = iPhone, 3 = CarPlay. */
         onStage: (Int) -> Unit = {},
         /** The CarPlay screen stream became active: the picture is arriving. */
@@ -172,7 +192,7 @@ object LegacyWirelessHost {
             },
             onConnectionFailure = { reason ->
                 log("wireless connection failure: $reason")
-                onStatus("Connection failed: $reason")
+                onStatus(StatusUpdate(HostStatus.CONNECTION_FAILED, reason))
             },
             onSessionEnded = {
                 // A session that had been established is gone for good (the iPhone ended the
@@ -215,7 +235,7 @@ object LegacyWirelessHost {
         var phone = findPhone()
         if (phone == null) {
             log("no paired iPhone found; pair an iPhone over Bluetooth first")
-            onStatus("No paired iPhone found\nPair an iPhone over Bluetooth first")
+            onStatus(StatusUpdate(HostStatus.NO_PAIRED))
         }
         while (phone == null) {
             Thread.sleep(3000L)
@@ -228,13 +248,13 @@ object LegacyWirelessHost {
     }
 
     /** A short progress label for the milestone log lines the controller emits. */
-    private fun statusFor(line: String): String? = when {
-        "Network mode" in line -> "Wi-Fi hotspot ready"
-        "listening on" in line -> "Waiting for the iPhone to connect"
-        "Bluetooth RFCOMM connected" in line -> "iPhone connected"
-        "Wi-Fi iAP2 authenticated" in line -> "CarPlay session ready"
-        "AirPlay session active" in line -> "Starting the screen…"
-        "AirPlay session ended" in line -> "Waiting for the iPhone to reconnect"
+    private fun statusFor(line: String): StatusUpdate? = when {
+        "Network mode" in line -> StatusUpdate(HostStatus.HOTSPOT_READY)
+        "listening on" in line -> StatusUpdate(HostStatus.WAITING_IPHONE)
+        "Bluetooth RFCOMM connected" in line -> StatusUpdate(HostStatus.IPHONE_CONNECTED)
+        "Wi-Fi iAP2 authenticated" in line -> StatusUpdate(HostStatus.CARPLAY_READY)
+        "AirPlay session active" in line -> StatusUpdate(HostStatus.STARTING_SCREEN)
+        "AirPlay session ended" in line -> StatusUpdate(HostStatus.RECONNECT_WAIT)
         else -> null
     }
 

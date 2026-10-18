@@ -33,14 +33,6 @@ class LegacySettingsActivity : Activity() {
         const val COLOR_LABEL = 0xFFECEFF1.toInt()
         const val COLOR_VALUE = 0xFF90A4AE.toInt()
         const val COLOR_HINT = 0xFF5E6E7B.toInt()
-
-        val NETWORK_MODE_LABELS = mapOf(
-            "auto" to "自动热点（推荐）",
-            "direct" to "Wi-Fi 直连",
-            "router" to "同一路由器",
-            "reuse" to "复用已有热点",
-        )
-        val FPS_LABELS = listOf("30 FPS（更省资源）", "60 FPS（更费资源）")
     }
 
     private lateinit var content: LinearLayout
@@ -59,7 +51,7 @@ class LegacySettingsActivity : Activity() {
             setBackgroundColor(COLOR_BACKGROUND)
         }
         root.addView(TextView(this).apply {
-            text = "CarPlay设置"
+            text = getString(R.string.settings_name)
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
             typeface = Typeface.DEFAULT_BOLD
@@ -88,6 +80,9 @@ class LegacySettingsActivity : Activity() {
     private fun render() {
         val density = resources.displayMetrics.density
         fun dp(value: Float): Int = (value * density).toInt()
+        // Ordered exactly like LegacySettings.networkModes (auto, direct, router, reuse).
+        val modeLabels = resources.getStringArray(R.array.network_mode_labels)
+        val fpsLabels = resources.getStringArray(R.array.fps_labels)
         content.removeAllViews()
 
         fun caption(text: String) {
@@ -212,11 +207,11 @@ class LegacySettingsActivity : Activity() {
                     AlertDialog.Builder(this@LegacySettingsActivity)
                         .setTitle(title)
                         .setView(input)
-                        .setPositiveButton("保存") { _, _ ->
+                        .setPositiveButton(getString(R.string.action_save)) { _, _ ->
                             LegacySettings.setRouterPassword(this@LegacySettingsActivity, input.text.toString())
                             render()
                         }
-                        .setNegativeButton("取消", null)
+                        .setNegativeButton(getString(R.string.action_cancel), null)
                         .show()
                 }
             }
@@ -230,72 +225,73 @@ class LegacySettingsActivity : Activity() {
                 }
                 top.addView(title(device.label), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                 top.addView(TextView(this).apply {
-                    text = "删除"
+                    text = getString(R.string.action_remove)
                     setTextColor(0xFFEF5350.toInt())
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
                     setPadding(dp(20f), dp(4f), 0, dp(4f))
                 })
                 r.addView(top)
-                r.addView(summary("删除后需与该 iPhone 重新配对才能再次连接"))
+                r.addView(summary(getString(R.string.device_remove_summary)))
                 r.setOnClickListener {
                     AlertDialog.Builder(this@LegacySettingsActivity)
-                        .setTitle("删除设备")
-                        .setMessage("确定删除「${device.label}」吗？删除后需与该 iPhone 重新配对才能再次连接。")
-                        .setPositiveButton("删除") { _, _ ->
+                        .setTitle(getString(R.string.device_remove_title))
+                        .setMessage(getString(R.string.device_remove_message, device.label))
+                        .setPositiveButton(getString(R.string.action_remove)) { _, _ ->
                             LegacySettings.deletePairedDevice(this@LegacySettingsActivity, device.key)
                             render()
                         }
-                        .setNegativeButton("取消", null)
+                        .setNegativeButton(getString(R.string.action_cancel), null)
                         .show()
                 }
             }
         }
 
-        caption("连接")
+        caption(getString(R.string.caption_connection))
         card { c ->
-            toggleRow(c, "打开即连接", "打开 CarPlay 应用后自动连接 iPhone",
+            toggleRow(c, getString(R.string.setting_autoconnect), getString(R.string.setting_autoconnect_summary),
                 LegacySettings.autoConnect(this)) { enabled ->
                 LegacySettings.setAutoConnect(this, enabled)
                 render()
             }
             val mode = LegacySettings.networkMode(this)
-            choiceRow(c, "网络模式", NETWORK_MODE_LABELS[mode] ?: NETWORK_MODE_LABELS.getValue("auto"),
-                "更改将在下次连接时生效",
-                LegacySettings.networkModes.map { NETWORK_MODE_LABELS[it] ?: it }) { index ->
+            val modeIndex = LegacySettings.networkModes.indexOf(mode).coerceAtLeast(0)
+            choiceRow(c, getString(R.string.setting_network_mode), modeLabels[modeIndex],
+                getString(R.string.setting_takes_effect),
+                modeLabels.toList()) { index ->
                 LegacySettings.setNetworkMode(this, LegacySettings.networkModes[index])
                 render()
             }
-            routerPasswordRow(c, "路由器密码",
-                if (LegacySettings.routerPassword(this).isEmpty()) "未设置" else "已设置",
-                "同一路由器模式下，iPhone 加入路由器所用的 WPA2 密码，更改将在下次连接时生效")
+            routerPasswordRow(c, getString(R.string.setting_router_password),
+                if (LegacySettings.routerPassword(this).isEmpty()) getString(R.string.value_unset) else getString(R.string.value_set),
+                getString(R.string.router_password_summary))
         }
 
-        caption("设备管理")
+        caption(getString(R.string.caption_devices))
         card { c ->
             val devices = LegacySettings.pairedDevices(this)
             if (devices.isEmpty()) {
                 row(c) { r ->
-                    r.addView(title("暂无已配对设备"))
-                    r.addView(summary("iPhone 连接配对后，会在此列出并可删除"))
+                    r.addView(title(getString(R.string.no_paired_devices)))
+                    r.addView(summary(getString(R.string.no_paired_devices_summary)))
                 }
             } else {
                 devices.forEach { deviceRow(c, it) }
             }
         }
 
-        caption("显示")
+        caption(getString(R.string.caption_display))
         card { c ->
             val fps = LegacySettings.fps(this)
-            choiceRow(c, "帧率", if (fps == 60) FPS_LABELS[1] else FPS_LABELS[0],
-                "更改将在下次连接时生效", FPS_LABELS) { index ->
+            choiceRow(c, getString(R.string.setting_fps), fpsLabels[if (fps == 60) 1 else 0],
+                getString(R.string.setting_takes_effect), fpsLabels.toList()) { index ->
                 LegacySettings.setFps(this, if (index == 1) 60 else 30)
                 render()
             }
         }
 
-        caption("CarPlay 控制")
+        caption(getString(R.string.caption_carplay_control))
         card { c ->
-            toggleRow(c, "右手驾驶", "车辆靠左行驶时使用，重新连接后生效",
+            toggleRow(c, getString(R.string.setting_rhd), getString(R.string.setting_rhd_summary),
                 LegacySettings.rightHandDrive(this)) { enabled ->
                 LegacySettings.setRightHandDrive(this, enabled)
                 render()

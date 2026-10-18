@@ -200,7 +200,7 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
         content.addView(title, centered(dp(12f)))
 
         val subtitle = TextView(this).apply {
-            text = "Wireless CarPlay"
+            text = getString(R.string.splash_subtitle)
             setTextColor(COLOR_LABEL)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             gravity = Gravity.CENTER
@@ -208,10 +208,10 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
         content.addView(subtitle, centered(dp(4f)))
 
         val stepLabels = arrayOf(
-            "Start the Wi-Fi hotspot",
-            "Connect to iPhone",
-            "Start the CarPlay session",
-            "Show the screen",
+            getString(R.string.step_hotspot),
+            getString(R.string.step_iphone),
+            getString(R.string.step_carplay),
+            getString(R.string.step_screen),
         )
         val steps = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -254,7 +254,7 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
         })
 
         val statusView = TextView(this).apply {
-            text = "Preparing the connection…"
+            text = getString(R.string.status_preparing)
             setTextColor(COLOR_LABEL)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             gravity = Gravity.CENTER
@@ -290,7 +290,7 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
         })
 
         waiting.addView(TextView(this).apply {
-            text = "等待连接"
+            text = getString(R.string.waiting_title)
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 30f)
             typeface = Typeface.DEFAULT_BOLD
@@ -298,21 +298,21 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
         }, centered(dp(24f)))
 
         waiting.addView(TextView(this).apply {
-            text = "没有发现已配对的 iPhone"
+            text = getString(R.string.waiting_subtitle)
             setTextColor(COLOR_ACTIVE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             gravity = Gravity.CENTER
         }, centered(dp(10f)))
 
         waiting.addView(TextView(this).apply {
-            text = "请开启车机蓝牙，并在蓝牙设置中\n与 iPhone 完成配对，配对成功后将自动连接"
+            text = getString(R.string.waiting_hint)
             setTextColor(COLOR_LABEL)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             gravity = Gravity.CENTER
         }, centered(dp(12f)))
 
         waiting.addView(TextView(this).apply {
-            text = "打开蓝牙设置"
+            text = getString(R.string.waiting_bt_button)
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             typeface = Typeface.DEFAULT_BOLD
@@ -342,7 +342,7 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
             },
         )
         finderRow.addView(TextView(this).apply {
-            text = "正在查找已配对的设备…"
+            text = getString(R.string.waiting_searching)
             setTextColor(COLOR_FADED)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             gravity = Gravity.CENTER
@@ -359,26 +359,26 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
             visibility = View.GONE
         }
         prompt.addView(TextView(this).apply {
-            text = "尚未连接"
+            text = getString(R.string.prompt_title)
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 30f)
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
         }, centered(dp(0f)))
         prompt.addView(TextView(this).apply {
-            text = "自动连接已关闭"
+            text = getString(R.string.prompt_subtitle)
             setTextColor(COLOR_ACTIVE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             gravity = Gravity.CENTER
         }, centered(dp(12f)))
         prompt.addView(TextView(this).apply {
-            text = "点击下方按钮开始连接 iPhone"
+            text = getString(R.string.prompt_hint)
             setTextColor(COLOR_LABEL)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             gravity = Gravity.CENTER
         }, centered(dp(8f)))
         prompt.addView(TextView(this).apply {
-            text = "开始连接"
+            text = getString(R.string.prompt_button)
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             typeface = Typeface.DEFAULT_BOLD
@@ -550,14 +550,26 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
     }
 
     /** Status updates arrive from the host's background threads; all UI work stays on the main thread. */
-    private fun setStatus(text: String) {
+    private fun setStatus(update: StatusUpdate) {
         if (destroyed) return
         runOnUiThread {
-            status?.text = text
-            when {
-                text.startsWith("Connection failed") -> failActiveRow()
-                text.startsWith("No paired iPhone found") -> showWaiting()
-                text.startsWith("Waiting for the iPhone to reconnect") -> rewindToSession()
+            status?.text = when (update.status) {
+                HostStatus.PREPARING -> getString(R.string.status_preparing)
+                HostStatus.HOTSPOT_READY -> getString(R.string.status_hotspot_ready)
+                HostStatus.WAITING_IPHONE -> getString(R.string.status_waiting_iphone)
+                HostStatus.IPHONE_CONNECTED -> getString(R.string.status_iphone_connected)
+                HostStatus.CARPLAY_READY -> getString(R.string.status_carplay_ready)
+                HostStatus.STARTING_SCREEN -> getString(R.string.status_starting_screen)
+                HostStatus.RECONNECT_WAIT -> getString(R.string.status_reconnect_wait)
+                HostStatus.NO_PAIRED -> getString(R.string.status_no_paired)
+                HostStatus.CONNECTION_FAILED ->
+                    getString(R.string.status_connection_failed, update.detail.orEmpty())
+            }
+            when (update.status) {
+                HostStatus.CONNECTION_FAILED -> failActiveRow()
+                HostStatus.NO_PAIRED -> showWaiting()
+                HostStatus.RECONNECT_WAIT -> rewindToSession()
+                else -> {}
             }
         }
     }
@@ -593,7 +605,7 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
             failActiveRow()
             status?.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             status?.setTextColor(COLOR_FAILED)
-            status?.text = "Start failed: $detail"
+            status?.text = getString(R.string.status_start_failed, detail)
         }
     }
 
@@ -624,7 +636,7 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
         started = true
         val surface: Surface = holder.surface
         boundSurface = surface
-        setStatus("Preparing the connection…")
+        setStatus(StatusUpdate(HostStatus.PREPARING))
         // The host builds the media sink and starts the controller bootstrap; run it off
         // the main thread so the loading screen keeps animating.
         Thread({
@@ -635,7 +647,7 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
                     width = width,
                     height = height,
                     log = { line -> Log.i(TAG, line) },
-                    onStatus = { text -> setStatus(text) },
+                    onStatus = { update -> setStatus(update) },
                     onStage = { step -> setStage(step) },
                     onVideo = { hideSplash() },
                 )

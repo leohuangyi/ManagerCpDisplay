@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CarPlay</string>
+    <string name="settings_name">CarPlay设置</string>
+
+    <!-- Splash / loading screen -->
+    <string name="splash_subtitle">无线 CarPlay</string>
+    <string name="step_hotspot">启动 Wi-Fi 热点</string>
+    <string name="step_iphone">连接 iPhone</string>
+    <string name="step_carplay">启动 CarPlay 会话</string>
+    <string name="step_screen">显示画面</string>
+
+    <!-- Status area -->
+    <string name="status_preparing">正在准备连接…</string>
+    <string name="status_hotspot_ready">Wi-Fi 热点已就绪</string>
+    <string name="status_waiting_iphone">等待 iPhone 连接</string>
+    <string name="status_iphone_connected">iPhone 已连接</string>
+    <string name="status_carplay_ready">CarPlay 会话已就绪</string>
+    <string name="status_starting_screen">正在启动画面…</string>
+    <string name="status_reconnect_wait">等待 iPhone 重新连接</string>
+    <string name="status_no_paired">没有发现已配对的 iPhone\n请先在蓝牙设置中与 iPhone 完成配对</string>
+    <string name="status_connection_failed">连接失败：%1$s</string>
+    <string name="status_start_failed">启动失败：%1$s</string>
+
+    <!-- Pairing hint -->
+    <string name="waiting_title">等待连接</string>
+    <string name="waiting_subtitle">没有发现已配对的 iPhone</string>
+    <string name="waiting_hint">请开启车机蓝牙，并在蓝牙设置中\n与 iPhone 完成配对，配对成功后将自动连接</string>
+    <string name="waiting_bt_button">打开蓝牙设置</string>
+    <string name="waiting_searching">正在查找已配对的设备…</string>
+
+    <!-- Start prompt -->
+    <string name="prompt_title">尚未连接</string>
+    <string name="prompt_subtitle">自动连接已关闭</string>
+    <string name="prompt_hint">点击下方按钮开始连接 iPhone</string>
+    <string name="prompt_button">开始连接</string>
+
+    <!-- Settings screen -->
+    <string name="caption_connection">连接</string>
+    <string name="setting_autoconnect">打开即连接</string>
+    <string name="setting_autoconnect_summary">打开 CarPlay 应用后自动连接 iPhone</string>
+    <string name="setting_network_mode">网络模式</string>
+    <string name="network_mode_auto">自动热点（推荐）</string>
+    <string name="network_mode_direct">Wi-Fi 直连</string>
+    <string name="network_mode_router">同一路由器</string>
+    <string name="network_mode_reuse">复用已有热点</string>
+    <string name="setting_takes_effect">更改将在下次连接时生效</string>
+    <string name="setting_router_password">路由器密码</string>
+    <string name="value_unset">未设置</string>
+    <string name="value_set">已设置</string>
+    <string name="router_password_summary">同一路由器模式下，iPhone 加入路由器所用的 WPA2 密码，更改将在下次连接时生效</string>
+    <string name="caption_devices">设备管理</string>
+    <string name="no_paired_devices">暂无已配对设备</string>
+    <string name="no_paired_devices_summary">iPhone 连接配对后，会在此列出并可删除</string>
+    <string name="action_remove">删除</string>
+    <string name="device_remove_summary">删除后需与该 iPhone 重新配对才能再次连接</string>
+    <string name="device_remove_title">删除设备</string>
+    <string name="device_remove_message">确定删除「%1$s」吗？删除后需与该 iPhone 重新配对才能再次连接。</string>
+    <string name="caption_display">显示</string>
+    <string name="setting_fps">帧率</string>
+    <string name="fps_30">30 FPS（更省资源）</string>
+    <string name="fps_60">60 FPS（更费资源）</string>
+    <string name="caption_carplay_control">CarPlay 控制</string>
+    <string name="setting_rhd">右手驾驶</string>
+    <string name="setting_rhd_summary">车辆靠左行驶时使用，重新连接后生效</string>
+    <string name="action_save">保存</string>
+    <string name="action_cancel">取消</string>
+</resources>

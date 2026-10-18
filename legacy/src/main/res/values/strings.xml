@@ -1,5 +1,81 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">CarPlay</string>
-    <string name="settings_name">CarPlay设置</string>
+    <string name="settings_name">CarPlay Settings</string>
+
+    <!-- Splash / loading screen -->
+    <string name="splash_subtitle">Wireless CarPlay</string>
+    <string name="step_hotspot">Start the Wi-Fi hotspot</string>
+    <string name="step_iphone">Connect to iPhone</string>
+    <string name="step_carplay">Start the CarPlay session</string>
+    <string name="step_screen">Show the screen</string>
+
+    <!-- Status area (HostStatus mapping lives in LegacyWirelessHost) -->
+    <string name="status_preparing">Preparing the connection…</string>
+    <string name="status_hotspot_ready">Wi-Fi hotspot ready</string>
+    <string name="status_waiting_iphone">Waiting for the iPhone to connect</string>
+    <string name="status_iphone_connected">iPhone connected</string>
+    <string name="status_carplay_ready">CarPlay session ready</string>
+    <string name="status_starting_screen">Starting the screen…</string>
+    <string name="status_reconnect_wait">Waiting for the iPhone to reconnect</string>
+    <string name="status_no_paired">No paired iPhone found\nPair an iPhone over Bluetooth first</string>
+    <string name="status_connection_failed">Connection failed: %1$s</string>
+    <string name="status_start_failed">Start failed: %1$s</string>
+
+    <!-- Pairing hint -->
+    <string name="waiting_title">Waiting for pairing</string>
+    <string name="waiting_subtitle">No paired iPhone found</string>
+    <string name="waiting_hint">Turn on Bluetooth on the head unit, then pair with your iPhone in Bluetooth settings. The connection starts automatically once paired.</string>
+    <string name="waiting_bt_button">Open Bluetooth Settings</string>
+    <string name="waiting_searching">Looking for paired devices…</string>
+
+    <!-- Start prompt -->
+    <string name="prompt_title">Not connected</string>
+    <string name="prompt_subtitle">Auto-connect is off</string>
+    <string name="prompt_hint">Tap the button below to connect to your iPhone</string>
+    <string name="prompt_button">Connect</string>
+
+    <!-- Settings screen -->
+    <string name="caption_connection">Connection</string>
+    <string name="setting_autoconnect">Connect on launch</string>
+    <string name="setting_autoconnect_summary">Connect to your iPhone automatically when the CarPlay app opens</string>
+    <string name="setting_network_mode">Network mode</string>
+    <string name="network_mode_auto">Auto hotspot (recommended)</string>
+    <string name="network_mode_direct">Wi-Fi Direct</string>
+    <string name="network_mode_router">Same router</string>
+    <string name="network_mode_reuse">Reuse existing hotspot</string>
+    <string name="setting_takes_effect">Takes effect on the next connection</string>
+    <string name="setting_router_password">Router password</string>
+    <string name="value_unset">Not set</string>
+    <string name="value_set">Set</string>
+    <string name="router_password_summary">The WPA2 password your iPhone uses to join the router in same-router mode. Takes effect on the next connection.</string>
+    <string name="caption_devices">Devices</string>
+    <string name="no_paired_devices">No paired devices yet</string>
+    <string name="no_paired_devices_summary">Once an iPhone is paired, it is listed here and can be removed.</string>
+    <string name="action_remove">Remove</string>
+    <string name="device_remove_summary">You must pair with this iPhone again after removing it.</string>
+    <string name="device_remove_title">Remove device</string>
+    <string name="device_remove_message">Remove &quot;%1$s&quot;? You must pair with this iPhone again after removing it.</string>
+    <string name="caption_display">Display</string>
+    <string name="setting_fps">Frame rate</string>
+    <string name="fps_30">30 FPS (better efficiency)</string>
+    <string name="fps_60">60 FPS (best quality)</string>
+    <string name="caption_carplay_control">CarPlay controls</string>
+    <string name="setting_rhd">Right-hand drive</string>
+    <string name="setting_rhd_summary">Use when the car drives on the left. Takes effect after reconnecting.</string>
+    <string name="action_save">Save</string>
+    <string name="action_cancel">Cancel</string>
+
+    <!-- Ordered exactly like LegacySettings.networkModes (auto, direct, router, reuse) -->
+    <string-array name="network_mode_labels">
+        <item>@string/network_mode_auto</item>
+        <item>@string/network_mode_direct</item>
+        <item>@string/network_mode_router</item>
+        <item>@string/network_mode_reuse</item>
+    </string-array>
+    <!-- Index 0 = 30 FPS, 1 = 60 FPS, matching LegacySettingsActivity. -->
+    <string-array name="fps_labels">
+        <item>@string/fps_30</item>
+        <item>@string/fps_60</item>
+    </string-array>
 </resources>
