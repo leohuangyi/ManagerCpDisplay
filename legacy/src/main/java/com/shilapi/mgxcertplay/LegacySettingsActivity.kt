@@ -6,12 +6,10 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
-import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -21,7 +19,7 @@ import android.widget.TextView
 /**
  * The settings screen of the legacy port, modeled after the reference project's settings
  * groups (DiPlayActivity), trimmed to what the legacy stack can actually obey: auto-connect,
- * network mode, router password, device management, frame rate and right-hand drive.
+ * device management, frame rate and right-hand drive.
  * Registered as its own launcher entry so the head unit's app list shows "CarPlay设置".
  */
 class LegacySettingsActivity : Activity() {
@@ -80,8 +78,6 @@ class LegacySettingsActivity : Activity() {
     private fun render() {
         val density = resources.displayMetrics.density
         fun dp(value: Float): Int = (value * density).toInt()
-        // Ordered exactly like LegacySettings.networkModes (auto, direct, router, reuse).
-        val modeLabels = resources.getStringArray(R.array.network_mode_labels)
         val fpsLabels = resources.getStringArray(R.array.fps_labels)
         content.removeAllViews()
 
@@ -179,44 +175,6 @@ class LegacySettingsActivity : Activity() {
             }
         }
 
-        fun routerPasswordRow(card: LinearLayout, title: String, value: String, summary: String) {
-            row(card) { r ->
-                val top = LinearLayout(this).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                }
-                top.addView(title(title), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-                top.addView(TextView(this).apply {
-                    text = value
-                    setTextColor(COLOR_VALUE)
-                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-                })
-                top.addView(TextView(this).apply {
-                    text = "\u203a" // ›
-                    setTextColor(COLOR_VALUE)
-                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
-                    setPadding(dp(6f), 0, 0, 0)
-                })
-                r.addView(top)
-                if (summary.isNotEmpty()) r.addView(summary(summary))
-                r.setOnClickListener {
-                    val input = EditText(this).apply {
-                        setText(LegacySettings.routerPassword(this@LegacySettingsActivity))
-                        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-                    }
-                    AlertDialog.Builder(this@LegacySettingsActivity)
-                        .setTitle(title)
-                        .setView(input)
-                        .setPositiveButton(getString(R.string.action_save)) { _, _ ->
-                            LegacySettings.setRouterPassword(this@LegacySettingsActivity, input.text.toString())
-                            render()
-                        }
-                        .setNegativeButton(getString(R.string.action_cancel), null)
-                        .show()
-                }
-            }
-        }
-
         fun deviceRow(card: LinearLayout, device: LegacySettings.PairedDevice) {
             row(card) { r ->
                 val top = LinearLayout(this).apply {
@@ -253,17 +211,6 @@ class LegacySettingsActivity : Activity() {
                 LegacySettings.setAutoConnect(this, enabled)
                 render()
             }
-            val mode = LegacySettings.networkMode(this)
-            val modeIndex = LegacySettings.networkModes.indexOf(mode).coerceAtLeast(0)
-            choiceRow(c, getString(R.string.setting_network_mode), modeLabels[modeIndex],
-                getString(R.string.setting_takes_effect),
-                modeLabels.toList()) { index ->
-                LegacySettings.setNetworkMode(this, LegacySettings.networkModes[index])
-                render()
-            }
-            routerPasswordRow(c, getString(R.string.setting_router_password),
-                if (LegacySettings.routerPassword(this).isEmpty()) getString(R.string.value_unset) else getString(R.string.value_set),
-                getString(R.string.router_password_summary))
         }
 
         caption(getString(R.string.caption_devices))
