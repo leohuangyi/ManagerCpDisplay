@@ -30,11 +30,29 @@ android {
         isCoreLibraryDesugaringEnabled = true
     }
 
+    lint {
+        // This module intentionally targets Android 4.2.2 head units (minSdk 17).
+        disable += "ExpiredTargetSdkVersion"
+    }
+
+    signingConfigs {
+        create("release") {
+            storeFile = file(
+                providers.environmentVariable("ANDROID_KEYSTORE_PATH")
+                    .getOrElse("missing-release-keystore.jks"),
+            )
+            storePassword = providers.environmentVariable("ANDROID_KEYSTORE_PASSWORD").getOrElse("")
+            keyAlias = providers.environmentVariable("ANDROID_KEY_ALIAS").getOrElse("")
+            keyPassword = providers.environmentVariable("ANDROID_KEY_PASSWORD").getOrElse("")
+        }
+    }
+
     buildTypes {
         release {
             optimization {
                 enable = true
             }
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 }
