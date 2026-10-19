@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothDevice
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.MotionEvent
 import android.view.Surface
@@ -78,6 +79,15 @@ object LegacyWirelessHost {
      */
     private const val EXIT_COOLDOWN_MS = 600L
 
+    /**
+     * Fast-reopen gate after a final exit: the activity finishes at once while the teardown
+     * thread keeps closing sockets and restoring the hotspot/Wi-Fi in the background. A
+     * reopen inside this window would race that teardown, so onCreate refuses it with a
+     * "still exiting" toast. The teardown thread clears the gate as soon as it finishes;
+     * this is only the cap for a teardown that hangs.
+     */
+    private const val EXIT_GATE_MS = 15_000L
+
     @Volatile private var controller: LegacyWirelessController? = null
     @Volatile private var sink: AndroidMediaSink? = null
     @Volatile private var videoWidth = 1280
@@ -93,6 +103,12 @@ object LegacyWirelessHost {
     @Volatile private var restartingWireless = false
     /** A final exit is in progress: recovery rebuilds and cold restarts must not run. */
     @Volatile private var exiting = false
+    /**
+     * Until when (elapsedRealtime) a fast reopen must be refused because the final-exit
+     * teardown thread is still closing sockets and restoring the hotspot in the background.
+     * 0 = no gate; the teardown thread clears it when it finishes.
+     */
+    @Volatile private var exitGateOpenUntil = 0L
     /**
      * The controller [prepareExit] handed off before nulling the live one; [shutdown] must
      * not tear it down again, its own teardown thread owns the close, cooldown and restore.
@@ -394,6 +410,14 @@ object LegacyWirelessHost {
         return next.beginSurfaceDetach(surface, parkMain = false).await()
     }
 
+    /**
+     * A final-exit teardown is still running in the background (or its gate has not elapsed):
+     * the activity finishes instantly on exit, so a reopen inside the window would race the
+     * socket close / hotspot restore. The caller shows a "still exiting" hint and closes.
+     */
+    @JvmStatic
+    fun isExitCoolingDown(): Boolean = exitGateOpenUntil > SystemClock.elapsedRealtime()
+
     @JvmStatic
     fun shutdown() {
         mainHandler.removeCallbacks(resumeRetry)
@@ -431,6 +455,8 @@ object LegacyWirelessHost {
         // round-trips can take tens of seconds; leaving them on the main thread starved
         // Activity.onDestroy past the 10 s destroy timeout and the UI appeared to ignore the exit.
         if (current != null) {
+            // Refuse a fast reopen (new onCreate) while this teardown is still running.
+            exitGateOpenUntil = SystemClock.elapsedRealtime() + EXIT_GATE_MS
             Thread({
                 try {
                     current.close()
@@ -444,6 +470,7 @@ object LegacyWirelessHost {
                 }
                 runCatching { current.restoreHotspotAfterCarPlay() }
                     .onFailure { Log.w(TAG, "Hotspot restore after CarPlay exit failed", it) }
+                exitGateOpenUntil = 0L
             }, "legacy-hotspot-restore").apply {
                 isDaemon = true
                 start()
@@ -473,6 +500,9 @@ object LegacyWirelessHost {
         val current = controller ?: return
         pendingExitRestore = current
         controller = null
+        // The activity finishes right now, but this teardown keeps running below: refuse a
+        // fast reopen while it does, or the new session would race the socket close.
+        exitGateOpenUntil = SystemClock.elapsedRealtime() + EXIT_GATE_MS
         Thread({
             try {
                 current.closeForExit()
@@ -487,6 +517,8 @@ object LegacyWirelessHost {
             }
             runCatching { current.restoreHotspotAfterCarPlay() }
                 .onFailure { Log.w(TAG, "Hotspot restore after CarPlay exit failed", it) }
+            // Teardown done: a reopen from here on starts a clean session.
+            exitGateOpenUntil = 0L
         }, "legacy-exit-prepare").apply {
             isDaemon = true
             start()

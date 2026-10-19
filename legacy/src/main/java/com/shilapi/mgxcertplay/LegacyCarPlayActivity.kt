@@ -132,6 +132,14 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Fast reopen right after a double-back-press exit: the background teardown thread is
+        // still closing sockets and restoring the hotspot, so refuse this launch with a hint
+        // instead of racing it. The gate drops by itself once that teardown finishes.
+        if (LegacyWirelessHost.isExitCoolingDown()) {
+            Toast.makeText(this, R.string.exit_in_progress, Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
         coldStartAt = SystemClock.elapsedRealtime()
         setContentView(buildUi())
     }
