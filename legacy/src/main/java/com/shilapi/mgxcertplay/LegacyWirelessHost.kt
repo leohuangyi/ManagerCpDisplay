@@ -482,7 +482,7 @@ object LegacyWirelessHost {
      * Final exit (the double-back-press in LegacyCarPlayActivity): the activity finishes
      * right away, while the wireless teardown keeps running on a background thread. The
      * controller is detached first so its session-ended callback cannot kick off a wireless
-     * rebuild; closeForExit() then runs off the main thread, a short settle window lets the
+     * rebuild; close() then runs off the main thread, a short settle window lets the
      * Bluetooth stack drain the RFCOMM/HFP teardown, and afterwards the hotspot/Wi-Fi
      * restore bounces the radio. [onDone] is posted to the main thread immediately, so the
      * activity finishes without waiting for the radio work; its onDestroy -> shutdown()
@@ -505,7 +505,7 @@ object LegacyWirelessHost {
         exitGateOpenUntil = SystemClock.elapsedRealtime() + EXIT_GATE_MS
         Thread({
             try {
-                current.closeForExit()
+                current.close()
             } catch (_: Throwable) {
             }
             // The crash signature (deadbaad invalid heap address in dlfree, inside the

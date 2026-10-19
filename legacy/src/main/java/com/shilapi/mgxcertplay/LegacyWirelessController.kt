@@ -93,8 +93,9 @@ class LegacyWirelessController(
     }
 
     private val closed = AtomicBoolean(false)
-    /** Final exit in progress: the bootstrap abandons its RFCOMM socket instead of closing it (see [closeForExit]). */
-    @Volatile private var exitAbandoningSocket = false
+    /** The live RFCOMM control stream/session of the Bluetooth bootstrap, closed by [closeRfcomm]. */
+    @Volatile private var rfcommStream: BluetoothRfcommDuplexStream? = null
+    @Volatile private var rfcommSession: Iap2Session? = null
     private val resources = CopyOnWriteArrayList<Closeable>()
     @Volatile private var bootstrapThread: Thread? = null
     private val trackThreads = CopyOnWriteArrayList<Thread>()
@@ -574,37 +575,46 @@ class LegacyWirelessController(
         // the whole start. Only the connect stage retries: a dropped established session is a
         // real failure, and the Wi-Fi tunnel keeps the session alive anyway.
         var attempt = 0
-        var socket: BluetoothSocket? = null
-        while (socket == null && !closed.get()) {
-            attempt += 1
-            val candidate = phone.createRfcommSocketToServiceRecord(UUID.fromString(RFCOMM_UUID))
-            try {
-                candidate.connect()
-                socket = candidate
-                if (closed.get()) {
-                    if (!exitAbandoningSocket) runCatching { candidate.close() }
-                    return
-                }
-                log(if (attempt > 1) "Bluetooth RFCOMM connected on attempt $attempt" else "Bluetooth RFCOMM connected")
-            } catch (e: IOException) {
-                if (!exitAbandoningSocket) runCatching { candidate.close() }
-                if (!closed.get() && attempt < RFCOMM_CONNECT_ATTEMPTS) {
-                    log("Bluetooth RFCOMM attempt $attempt failed (${e.message}); retrying")
-                    try {
-                        Thread.sleep(RFCOMM_CONNECT_RETRY_DELAY_MS)
-                    } catch (_: InterruptedException) {
+        var connected: BluetoothSocket? = null
+        var stream: BluetoothRfcommDuplexStream? = null
+        try {
+            while (connected == null && !closed.get()) {
+                attempt += 1
+                val candidate = phone.createRfcommSocketToServiceRecord(UUID.fromString(RFCOMM_UUID))
+                try {
+                    candidate.connect()
+                    connected = candidate
+                    if (closed.get()) {
+                        // close() won while connect was in flight. The bootstrap thread owns
+                        // this socket until it is handed to the stream below, so it must be
+                        // the one to close it here.
+                        runCatching { candidate.close() }
                         return
                     }
-                } else {
-                    if (!closed.get()) failure("Bluetooth bootstrap", e)
-                    return
+                    log(if (attempt > 1) "Bluetooth RFCOMM connected on attempt $attempt" else "Bluetooth RFCOMM connected")
+                } catch (e: IOException) {
+                    runCatching { candidate.close() }
+                    if (!closed.get() && attempt < RFCOMM_CONNECT_ATTEMPTS) {
+                        log("Bluetooth RFCOMM attempt $attempt failed (${e.message}); retrying")
+                        try {
+                            Thread.sleep(RFCOMM_CONNECT_RETRY_DELAY_MS)
+                        } catch (_: InterruptedException) {
+                            return
+                        }
+                    } else {
+                        if (!closed.get()) failure("Bluetooth bootstrap", e)
+                        return
+                    }
                 }
             }
-        }
-        val connected = socket ?: return
-        try {
-            val stream = BluetoothRfcommDuplexStream(connected) { log("rfcomm: $it") }
-            val session = Iap2Session.openWireless(stream)
+            val socket = connected ?: return
+            // Publish the stream before the session so a close() racing this window reaches
+            // the socket through the stream, not through a half-built session.
+            val rfcomm = BluetoothRfcommDuplexStream(socket) { log("rfcomm: $it") }
+            rfcommStream = rfcomm
+            stream = rfcomm
+            val session = Iap2Session.openWireless(rfcomm)
+            rfcommSession = session
             Iap2WirelessControlClient(session, mfiClient).run(
                 identification = identification,
                 endpoint = endpoint,
@@ -614,14 +624,15 @@ class LegacyWirelessController(
         } catch (e: Throwable) {
             if (!closed.get()) failure("Bluetooth bootstrap", e)
         } finally {
-            // Final exit: hand the RFCOMM socket to the kernel instead of closing it — a close
-            // that races the exit teardown crashed the process natively on this head unit
-            // (deadbaad invalid heap address in the framework's Bluetooth close native). See
-            // closeForExit. An in-process restart keeps closing it so the stale channel clears.
-            if (exitAbandoningSocket) {
-                log("final exit: abandoning the RFCOMM socket to the kernel")
+            // Detach before closing so a later run starts with a fresh channel; the stream owns
+            // the socket and closes it idempotently. For a socket that never made it into a
+            // stream (exit raced the hand-over), this thread still owns it and closes it directly.
+            rfcommStream = null
+            rfcommSession = null
+            if (stream != null) {
+                runCatching { stream.close() }
             } else {
-                runCatching { connected.close() }
+                runCatching { connected?.close() }
             }
         }
     }
@@ -721,18 +732,6 @@ class LegacyWirelessController(
         onConnectionFailure("$stage: $detail")
     }
 
-    /**
-     * Final-exit teardown. Like [close], except the bootstrap thread abandons its RFCOMM
-     * socket instead of closing it: on this head unit a Bluetooth socket close that races
-     * the exit teardown crashed the process natively (deadbaad invalid heap address in
-     * dlfree inside the framework's Bluetooth close native). The kernel reclaims the fd at
-     * process death, which follows this close immediately, so nothing leaks.
-     */
-    fun closeForExit() {
-        exitAbandoningSocket = true
-        close()
-    }
-
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         // The bootstrap and its preparation tracks keep building and using the resources
@@ -744,8 +743,15 @@ class LegacyWirelessController(
         // the process natively (deadbaad invalid heap address in dlfree).
         bootstrapThread?.interrupt()
         trackThreads.forEach { it.interrupt() }
+        // The interrupt misses the bootstrap's blocking RFCOMM recv (the stream re-asserts
+        // the interrupt flag and keeps waiting), so close the session and stream to break
+        // that recv and free the RFCOMM channel before the joins below.
+        closeRfcomm()
         bootstrapThread?.let { joinBounded(it, BOOTSTRAP_EXIT_WAIT_MS) }
         trackThreads.forEach { joinBounded(it, TRACK_EXIT_WAIT_MS) }
+        // Covers the bootstrap that raced the first call and published its stream only after
+        // it: a second close registers the fresh socket and collapses the 60s recv wait.
+        closeRfcomm()
         activeSession = null
         sessions.forEach { runCatching { it.close() } }
         sessions.clear()
@@ -757,6 +763,17 @@ class LegacyWirelessController(
         wifiLocks.clear()
         resources.forEach { runCatching { it.close() } }
         resources.clear()
+    }
+
+    /**
+     * Closes the live Bluetooth control session and its RFCOMM stream. The session close
+     * cascades channel -> link -> stream, which shuts the socket and wakes the reader; the
+     * stream close afterwards is the idempotent fallback for a session that exists without a
+     * published stream. Both are safe to call from any thread.
+     */
+    private fun closeRfcomm() {
+        runCatching { rfcommSession?.close() }
+        runCatching { rfcommStream?.close() }
     }
 
     /** Waits for [thread] to exit, restoring this thread's interrupt flag if the wait is cut short. */
