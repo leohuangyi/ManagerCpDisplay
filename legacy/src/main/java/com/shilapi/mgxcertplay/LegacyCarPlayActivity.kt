@@ -672,10 +672,10 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
     /**
      * A single back press would silently drop the CarPlay session, so guard it with a
      * double-press window: the first press only shows a hint, a second press inside
-     * [BACK_EXIT_WINDOW_MS] starts the graceful exit. The wireless stack tears down on a
-     * background thread first, and the activity only finishes once that is done (the host
-     * then restores the head unit hotspot and network access), so the process teardown
-     * never races the Bluetooth/socket close that crashed it natively before.
+     * [BACK_EXIT_WINDOW_MS] starts the graceful exit. The activity finishes immediately;
+     * the wireless teardown (close + Bluetooth settle + Wi-Fi restore) keeps running on a
+     * background thread, so the process teardown never races the Bluetooth/socket close
+     * that crashed it natively before.
      */
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         if (keyCode == KeyEvent.KEYCODE_BACK && event.repeatCount == 0) {
@@ -695,8 +695,8 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
     /**
      * Second back press inside the window: release the video stream, show the disconnect
      * notice and hand the wireless teardown (close + Bluetooth settle + Wi-Fi restore) to
-     * [LegacyWirelessHost.prepareExit] off the main thread. Its completion callback finishes
-     * the activity on the main thread; onDestroy then only cleans up what is left.
+     * [LegacyWirelessHost.prepareExit]. The activity finishes right away; the teardown
+     * continues on a background thread and onDestroy only cleans up what is left.
      */
     private fun beginGracefulExit() {
         exiting = true

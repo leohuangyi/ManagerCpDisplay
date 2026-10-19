@@ -452,26 +452,25 @@ object LegacyWirelessHost {
     }
 
     /**
-     * Final exit (the double-back-press in LegacyCarPlayActivity): tears the wireless stack
-     * down gracefully BEFORE the activity finishes. The controller is detached first so its
-     * session-ended callback cannot kick off a wireless rebuild; closeForExit() then runs off
-     * the main thread, a short settle window lets the Bluetooth stack drain the RFCOMM/HFP
-     * teardown, and only then the hotspot/Wi-Fi restore bounces the radio. [onDone] is posted
-     * to the main thread once that finished — the activity finishes then, and its
-     * onDestroy -> shutdown() finds nothing left to race.
+     * Final exit (the double-back-press in LegacyCarPlayActivity): the activity finishes
+     * right away, while the wireless teardown keeps running on a background thread. The
+     * controller is detached first so its session-ended callback cannot kick off a wireless
+     * rebuild; closeForExit() then runs off the main thread, a short settle window lets the
+     * Bluetooth stack drain the RFCOMM/HFP teardown, and afterwards the hotspot/Wi-Fi
+     * restore bounces the radio. [onDone] is posted to the main thread immediately, so the
+     * activity finishes without waiting for the radio work; its onDestroy -> shutdown()
+     * finds the pending hand-off and leaves this background thread to finish the job.
      */
     @JvmStatic
     fun prepareExit(onDone: () -> Unit) {
-        if (exiting) {
-            mainHandler.post(onDone)
-            return
-        }
+        // Finish first, disconnect in the background: posting onDone lets the caller run
+        // finish() on the main thread right away, nothing here holds it up. The detach below
+        // still happens synchronously before finish() is processed, so onDestroy -> shutdown()
+        // sees the hand-off and does not tear the stack down a second time.
+        mainHandler.post(onDone)
+        if (exiting) return
         exiting = true
-        val current = controller
-        if (current == null) {
-            mainHandler.post(onDone)
-            return
-        }
+        val current = controller ?: return
         pendingExitRestore = current
         controller = null
         Thread({
@@ -488,7 +487,6 @@ object LegacyWirelessHost {
             }
             runCatching { current.restoreHotspotAfterCarPlay() }
                 .onFailure { Log.w(TAG, "Hotspot restore after CarPlay exit failed", it) }
-            mainHandler.post(onDone)
         }, "legacy-exit-prepare").apply {
             isDaemon = true
             start()
