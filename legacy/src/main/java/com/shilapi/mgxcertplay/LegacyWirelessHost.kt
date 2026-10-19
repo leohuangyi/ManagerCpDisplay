@@ -63,13 +63,20 @@ object LegacyWirelessHost {
      */
     private const val SCREEN_RESUME_RETRY_DELAY_MS = 3_000L
 
-    /**
-     * How long a screen stream that died while the app stayed in the foreground may sit silent
+    /** How long a screen stream that died while the app stayed in the foreground may sit silent
      * before the full wireless reboot. The key frame request that goes out first revives a
      * live-but-wedged stream, so this window only catches a session that died without a pause
      * (the resume machinery never arms for those).
      */
     private const val SCREEN_STALL_TIMEOUT_MS = 10_000L
+
+    /**
+     * How long the final-exit teardown settles after the sockets are closed, before the
+     * hotspot/Wi-Fi restore bounces the radio. The Bluetooth stack is still draining the
+     * RFCOMM/HFP teardown right after close(); bouncing Wi-Fi concurrently with it crashed
+     * the process natively (deadbaad invalid heap address in dlfree).
+     */
+    private const val EXIT_COOLDOWN_MS = 600L
 
     @Volatile private var controller: LegacyWirelessController? = null
     @Volatile private var sink: AndroidMediaSink? = null
@@ -84,6 +91,13 @@ object LegacyWirelessHost {
     @Volatile private var suspendingScreen = false
     /** A full wireless reboot is being rebuilt; its teardown edges must not re-arm recovery. */
     @Volatile private var restartingWireless = false
+    /** A final exit is in progress: recovery rebuilds and cold restarts must not run. */
+    @Volatile private var exiting = false
+    /**
+     * The controller [prepareExit] handed off before nulling the live one; [shutdown] must
+     * not tear it down again, its own teardown thread owns the close, cooldown and restore.
+     */
+    @Volatile private var pendingExitRestore: LegacyWirelessController? = null
     /** The newest surface [attachSurface] saw; a full restart rebinds to it. */
     @Volatile private var currentSurface: Surface? = null
     /** Cold-start re-entry built from the first [start] call; runs a full wireless reboot. */
@@ -127,6 +141,10 @@ object LegacyWirelessHost {
         onVideo: () -> Unit = {},
     ) {
         if (controller != null) return
+        // A fresh boot cancels a previous exit that never finished; that exit's teardown
+        // thread holds its own reference and the restore it runs is idempotent.
+        exiting = false
+        pendingExitRestore = null
         // Record the surface this build renders to. restartWireless() rebinds to it, and on a
         // cold start the first surfaceChanged routes through the !started branch in the activity
         // (which only spawns start()) without an attachSurface, so currentSurface would stay null
@@ -212,18 +230,22 @@ object LegacyWirelessHost {
         // recovery is therefore a full wireless reboot, re-run against the newest surface.
         restarter = { target ->
             Thread({
-                runCatching {
-                    start(
-                        context = appContext,
-                        surface = target,
-                        width = videoWidth,
-                        height = videoHeight,
-                        log = log,
-                        onStatus = onStatus,
-                        onStage = onStage,
-                        onVideo = onVideo,
-                    )
-                }.onFailure { error -> runCatching { log("wireless restart failed: $error") } }
+                if (exiting) {
+                    log("wireless restart skipped: final exit in progress")
+                } else {
+                    runCatching {
+                        start(
+                            context = appContext,
+                            surface = target,
+                            width = videoWidth,
+                            height = videoHeight,
+                            log = log,
+                            onStatus = onStatus,
+                            onStage = onStage,
+                            onVideo = onVideo,
+                        )
+                    }.onFailure { error -> runCatching { log("wireless restart failed: $error") } }
+                }
             }, "legacy-host-restart").apply {
                 isDaemon = true
                 start()
@@ -333,6 +355,10 @@ object LegacyWirelessHost {
      * alone, so the stack restarts from the RFCOMM listener, exactly like a cold start.
      */
     private fun restartWireless() {
+        if (exiting) {
+            Log.i(TAG, "restartWireless abort: final exit in progress")
+            return
+        }
         Log.i(TAG, "restartWireless entry: restarter=${restarter != null}, currentSurface=${currentSurface != null}")
         val action = restarter
         if (action == null) { Log.w(TAG, "restartWireless abort: no restarter"); return }
@@ -378,8 +404,13 @@ object LegacyWirelessHost {
         videoSuspended = false
         currentSurface = null
         restarter = null
-        val current = controller
+        // prepareExit() detached the controller before this (the normal double-back-press
+        // flow): its teardown thread owns the close, the settle cooldown and the Wi-Fi
+        // restore, so nothing here may run against it again.
+        val prepared = pendingExitRestore != null
+        val current = controller ?: pendingExitRestore
         controller = null
+        pendingExitRestore = null
         sink = null
         // The in-process wireless restart rebuilds the hotspot itself through prepareAuto and
         // must have the old engine fully closed before the restarter boots the next one, so its
@@ -391,17 +422,25 @@ object LegacyWirelessHost {
             }
             return
         }
-        // Final exit (e.g. the double-back-press in LegacyCarPlayActivity): every remaining
-        // step moves off the main thread. close() tears the hotspot down and the restore then
-        // bounces Wi-Fi (svc wifi disable -> enable) over the su broadcast channel, so the head
-        // unit rejoins its saved Wi-Fi networks by itself. Both su round-trips can take tens of
-        // seconds; leaving them on the main thread starved Activity.onDestroy past the 10 s
-        // destroy timeout and the UI appeared to ignore the exit.
+        if (prepared) return
+        exiting = true
+        // Final exit without the double-back path (the activity was destroyed another way):
+        // every remaining step moves off the main thread. close() tears the hotspot down and
+        // the restore then bounces Wi-Fi (svc wifi disable -> enable) over the su broadcast
+        // channel, so the head unit rejoins its saved Wi-Fi networks by itself. Both su
+        // round-trips can take tens of seconds; leaving them on the main thread starved
+        // Activity.onDestroy past the 10 s destroy timeout and the UI appeared to ignore the exit.
         if (current != null) {
             Thread({
                 try {
                     current.close()
                 } catch (_: Throwable) {
+                }
+                // Same settle window as prepareExit(): the radio bounce must never race the
+                // Bluetooth teardown.
+                try {
+                    Thread.sleep(EXIT_COOLDOWN_MS)
+                } catch (_: InterruptedException) {
                 }
                 runCatching { current.restoreHotspotAfterCarPlay() }
                     .onFailure { Log.w(TAG, "Hotspot restore after CarPlay exit failed", it) }
@@ -409,6 +448,50 @@ object LegacyWirelessHost {
                 isDaemon = true
                 start()
             }
+        }
+    }
+
+    /**
+     * Final exit (the double-back-press in LegacyCarPlayActivity): tears the wireless stack
+     * down gracefully BEFORE the activity finishes. The controller is detached first so its
+     * session-ended callback cannot kick off a wireless rebuild; closeForExit() then runs off
+     * the main thread, a short settle window lets the Bluetooth stack drain the RFCOMM/HFP
+     * teardown, and only then the hotspot/Wi-Fi restore bounces the radio. [onDone] is posted
+     * to the main thread once that finished — the activity finishes then, and its
+     * onDestroy -> shutdown() finds nothing left to race.
+     */
+    @JvmStatic
+    fun prepareExit(onDone: () -> Unit) {
+        if (exiting) {
+            mainHandler.post(onDone)
+            return
+        }
+        exiting = true
+        val current = controller
+        if (current == null) {
+            mainHandler.post(onDone)
+            return
+        }
+        pendingExitRestore = current
+        controller = null
+        Thread({
+            try {
+                current.closeForExit()
+            } catch (_: Throwable) {
+            }
+            // The crash signature (deadbaad invalid heap address in dlfree, inside the
+            // framework's Bluetooth close native) came from tearing the sockets and the radio
+            // down concurrently; let the Bluetooth stack settle before the Wi-Fi bounce.
+            try {
+                Thread.sleep(EXIT_COOLDOWN_MS)
+            } catch (_: InterruptedException) {
+            }
+            runCatching { current.restoreHotspotAfterCarPlay() }
+                .onFailure { Log.w(TAG, "Hotspot restore after CarPlay exit failed", it) }
+            mainHandler.post(onDone)
+        }, "legacy-exit-prepare").apply {
+            isDaemon = true
+            start()
         }
     }
 

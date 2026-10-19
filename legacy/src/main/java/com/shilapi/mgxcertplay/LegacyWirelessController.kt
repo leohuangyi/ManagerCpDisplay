@@ -87,10 +87,17 @@ class LegacyWirelessController(
         private const val CONSTRAINT_NEVER = 1000
         /** Apple's predefined borrowID for a screen the vehicle is not showing. */
         private const val BORROW_ID_DISPLAY_OFF = "displayOff"
+        /** How long [close] waits for the bootstrap thread and its preparation tracks to exit. */
+        private const val BOOTSTRAP_EXIT_WAIT_MS = 5_000L
+        private const val TRACK_EXIT_WAIT_MS = 2_000L
     }
 
     private val closed = AtomicBoolean(false)
+    /** Final exit in progress: the bootstrap abandons its RFCOMM socket instead of closing it (see [closeForExit]). */
+    @Volatile private var exitAbandoningSocket = false
     private val resources = CopyOnWriteArrayList<Closeable>()
+    @Volatile private var bootstrapThread: Thread? = null
+    private val trackThreads = CopyOnWriteArrayList<Thread>()
 
     /** The network handle of the running bootstrap, kept for the post-CarPlay hotspot restore. */
     @Volatile private var network: LegacyNetwork? = null
@@ -148,6 +155,7 @@ class LegacyWirelessController(
     fun start(phone: BluetoothDevice) {
         Thread({ bootstrap(phone) }, "legacy-carplay-start").apply {
             isDaemon = true
+            bootstrapThread = this
             start()
         }
     }
@@ -278,6 +286,7 @@ class LegacyWirelessController(
                 }
             }, name).apply {
                 isDaemon = true
+                trackThreads += this
                 start()
             }
         }
@@ -572,9 +581,13 @@ class LegacyWirelessController(
             try {
                 candidate.connect()
                 socket = candidate
+                if (closed.get()) {
+                    if (!exitAbandoningSocket) runCatching { candidate.close() }
+                    return
+                }
                 log(if (attempt > 1) "Bluetooth RFCOMM connected on attempt $attempt" else "Bluetooth RFCOMM connected")
             } catch (e: IOException) {
-                runCatching { candidate.close() }
+                if (!exitAbandoningSocket) runCatching { candidate.close() }
                 if (!closed.get() && attempt < RFCOMM_CONNECT_ATTEMPTS) {
                     log("Bluetooth RFCOMM attempt $attempt failed (${e.message}); retrying")
                     try {
@@ -601,7 +614,15 @@ class LegacyWirelessController(
         } catch (e: Throwable) {
             if (!closed.get()) failure("Bluetooth bootstrap", e)
         } finally {
-            runCatching { connected.close() }
+            // Final exit: hand the RFCOMM socket to the kernel instead of closing it — a close
+            // that races the exit teardown crashed the process natively on this head unit
+            // (deadbaad invalid heap address in the framework's Bluetooth close native). See
+            // closeForExit. An in-process restart keeps closing it so the stale channel clears.
+            if (exitAbandoningSocket) {
+                log("final exit: abandoning the RFCOMM socket to the kernel")
+            } else {
+                runCatching { connected.close() }
+            }
         }
     }
 
@@ -700,8 +721,31 @@ class LegacyWirelessController(
         onConnectionFailure("$stage: $detail")
     }
 
+    /**
+     * Final-exit teardown. Like [close], except the bootstrap thread abandons its RFCOMM
+     * socket instead of closing it: on this head unit a Bluetooth socket close that races
+     * the exit teardown crashed the process natively (deadbaad invalid heap address in
+     * dlfree inside the framework's Bluetooth close native). The kernel reclaims the fd at
+     * process death, which follows this close immediately, so nothing leaks.
+     */
+    fun closeForExit() {
+        exitAbandoningSocket = true
+        close()
+    }
+
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        // The bootstrap and its preparation tracks keep building and using the resources
+        // below while they run. Give them first crack at stopping: interrupt so the
+        // blocking stages (su round-trips, Bluetooth connects, latch waits) unwind
+        // promptly, then wait a bounded time for each to exit. Without this, a quick
+        // "start then exit" let the shutdown thread tear the network/hotspot down while
+        // a preparation track was still using it, and the concurrent teardown crashed
+        // the process natively (deadbaad invalid heap address in dlfree).
+        bootstrapThread?.interrupt()
+        trackThreads.forEach { it.interrupt() }
+        bootstrapThread?.let { joinBounded(it, BOOTSTRAP_EXIT_WAIT_MS) }
+        trackThreads.forEach { joinBounded(it, TRACK_EXIT_WAIT_MS) }
         activeSession = null
         sessions.forEach { runCatching { it.close() } }
         sessions.clear()
@@ -713,6 +757,15 @@ class LegacyWirelessController(
         wifiLocks.clear()
         resources.forEach { runCatching { it.close() } }
         resources.clear()
+    }
+
+    /** Waits for [thread] to exit, restoring this thread's interrupt flag if the wait is cut short. */
+    private fun joinBounded(thread: Thread, timeoutMillis: Long) {
+        try {
+            thread.join(timeoutMillis)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
     }
 
     /**

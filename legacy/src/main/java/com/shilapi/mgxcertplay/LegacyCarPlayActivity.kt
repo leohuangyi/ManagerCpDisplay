@@ -125,6 +125,8 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
     private var coldStartAt = 0L
     /** Uptime of the last back press, for the double-press-to-exit guard. */
     private var lastBackPressAt = 0L
+    /** The graceful disconnect of a double-back-press exit is running; later presses are ignored. */
+    private var exiting = false
 
     // -- lifecycle -------------------------------------------------------------------
 
@@ -670,14 +672,17 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
     /**
      * A single back press would silently drop the CarPlay session, so guard it with a
      * double-press window: the first press only shows a hint, a second press inside
-     * [BACK_EXIT_WINDOW_MS] finishes the activity. onDestroy then shuts the host down,
-     * which also restores the head unit hotspot and network access.
+     * [BACK_EXIT_WINDOW_MS] starts the graceful exit. The wireless stack tears down on a
+     * background thread first, and the activity only finishes once that is done (the host
+     * then restores the head unit hotspot and network access), so the process teardown
+     * never races the Bluetooth/socket close that crashed it natively before.
      */
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         if (keyCode == KeyEvent.KEYCODE_BACK && event.repeatCount == 0) {
+            if (exiting) return true
             val now = SystemClock.uptimeMillis()
             if (now - lastBackPressAt <= BACK_EXIT_WINDOW_MS) {
-                finish()
+                beginGracefulExit()
             } else {
                 lastBackPressAt = now
                 Toast.makeText(this, R.string.exit_double_press_hint, Toast.LENGTH_SHORT).show()
@@ -685,6 +690,21 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
             return true
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    /**
+     * Second back press inside the window: release the video stream, show the disconnect
+     * notice and hand the wireless teardown (close + Bluetooth settle + Wi-Fi restore) to
+     * [LegacyWirelessHost.prepareExit] off the main thread. Its completion callback finishes
+     * the activity on the main thread; onDestroy then only cleans up what is left.
+     */
+    private fun beginGracefulExit() {
+        exiting = true
+        if (started) LegacyWirelessHost.suspendVideo()
+        Toast.makeText(this, R.string.exit_disconnecting, Toast.LENGTH_LONG).show()
+        LegacyWirelessHost.prepareExit {
+            if (!destroyed && !isFinishing) finish()
+        }
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
