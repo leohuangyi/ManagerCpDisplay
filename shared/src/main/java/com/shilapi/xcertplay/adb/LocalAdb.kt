@@ -143,10 +143,12 @@ class LocalAdb(context: Context) : Closeable {
             if (stdin != null) intent.putExtra(EXTRA_STDIN, stdin)
         }
         if (!awaitPending(result, requestId, bounded + RESULT_GRACE_MILLIS)) return null
-        return if (result.output != null) {
-            RootResult(result.exit, result.output)
-        } else {
+        // 助手应答失败（未激活/timed out/无 su 等）时 error 非空且 output 常被填成空串，
+        // 必须优先透传 error；只有 error 为空才代表命令真正执行，output 才是真实输出。
+        return if (result.error != null) {
             RootResult(result.exit, result.error)
+        } else {
+            RootResult(result.exit, result.output)
         }
     }
 

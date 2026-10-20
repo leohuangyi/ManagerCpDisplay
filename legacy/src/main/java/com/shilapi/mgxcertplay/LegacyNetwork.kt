@@ -6,9 +6,13 @@ import android.net.wifi.WifiManager
 import android.net.wifi.p2p.WifiP2pGroup
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Looper
+import java.io.BufferedReader
 import java.io.Closeable
 import java.io.File
+import java.io.IOException
+import java.io.InputStreamReader
 import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.NetworkInterface
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
@@ -16,11 +20,9 @@ import java.util.concurrent.TimeUnit
 import com.shilapi.xcertplay.adb.LocalAdb
 
 /**
- * Brings up the wireless link for CarPlay. Mirrors the reference implementation's three modes:
+ * Brings up the wireless link for CarPlay:
  *
  *  - `direct`: Wi-Fi Direct Group Owner via [WifiP2pManager.createGroup] (needs P2P-capable firmware).
- *  - `router`: the head unit and iPhone join the same WPA2 router.
- *  - `reuse`: discover an already-running hotspot without touching Wi-Fi.
  *  - `auto`: start the hotspot natively over root (hostapd -> static IP -> dnsmasq), since the
  *    miwifi firmware's `setWifiApEnabled` never launches hostapd; reuses it when already up.
  *  - `app` / `saved`: the head unit becomes a WPA2 hotspot through the hidden
@@ -39,6 +41,7 @@ class LegacyNetwork(
         val channel: Int,
         val iface: NetworkInterface,
         val address: Inet4Address,
+        val addresses: List<InetAddress> = listOf(address),
     )
 
     private val wifi: WifiManager = context.getSystemService(Context.WIFI_SERVICE) as WifiManager
@@ -50,11 +53,10 @@ class LegacyNetwork(
     private var apWasEnabled = false
     private var changedAp = false
     private var hotspotStartedByUs = false
+    @Volatile private var assistantDown = false
 
     fun prepare(): Endpoint = when (networkMode) {
         "direct" -> prepareDirect()
-        "router" -> prepareRouter()
-        "reuse" -> prepareReuse()
         "auto" -> prepareAuto()
         else -> prepareSoftAp()
     }
@@ -124,37 +126,6 @@ class LegacyNetwork(
         return credentials
     }
 
-    // --- Same-WPA2-router ------------------------------------------------------------------
-
-    private fun prepareRouter(): Endpoint {
-        check(wifi.isWifiEnabled) {
-            "Connect head unit and iPhone to the same WPA2 router first"
-        }
-        raiseRmemMax()
-        val ssid = unquote(wifi.connectionInfo.ssid ?: "")
-        val password = context.getSharedPreferences("receiver-ui", Context.MODE_PRIVATE)
-            .getString("routerPassword", "") ?: ""
-        val passwordValid = password.length in 8 until 64
-        check(ssid.isNotBlank() && ssid != "<unknown ssid>" && passwordValid) {
-            "Router WPA2 password must be configured"
-        }
-        val (iface, address) = findEndpoint(listOf("wlan", "ap"))
-            ?: throw IllegalStateException("Network IPv4 address unavailable")
-        log("Network mode=$networkMode interface=${iface.name} ready=true")
-        return Endpoint(ssid, password, channel = 0, iface, address)
-    }
-
-    // --- Reuse an already-running hotspot (manual hostapd/dnsmasq) -------------------------
-    // The miwifi firmware's setWifiApEnabled does not start hostapd, so the hotspot is brought
-    // up manually (root) and this mode only discovers the endpoint without touching Wi-Fi.
-    private fun prepareReuse(): Endpoint {
-        raiseRmemMax()
-        val (iface, address) = findEndpoint(listOf("wlan", "ap"))
-            ?: throw IllegalStateException("Network IPv4 address unavailable")
-        log("Network mode=$networkMode interface=${iface.name} ready=true")
-        return Endpoint("DiPlay-Legacy", "diplay1234", channel = 6, iface, address)
-    }
-
     // --- Hotspot automation (hostapd + static IP + dnsmasq through su) ---------------------
     // The miwifi firmware ships a client-only Wi-Fi stack: services.jar has no hostapd /
     // startSoftAp code, the OEM WifiApService only joins external hotspots and WifiApp has
@@ -183,7 +154,7 @@ class LegacyNetwork(
         // the rmem_max raise. Three separate su spawns cost about a second each on this unit.
         val (prepRc, prepOut) = runSu(SU_HOTSPOT_PREP, timeoutSeconds = 8)
         if (prepRc != 0 || !prepOut.contains("uid=0")) {
-            throw IllegalStateException("Hotspot automation needs root")
+            throw IllegalStateException("H a n r请检查权限是否开启")
         }
         val (ssid, password, channel) = parseAndCacheHotspotProfile(prepOut)
 
@@ -284,10 +255,60 @@ class LegacyNetwork(
 
     /** Runs a rooted script in the assistant app, reached over broadcast (no local su anymore). */
     private fun runSu(script: String, timeoutSeconds: Long = 20): Pair<Int, String> {
-        val result = LocalAdb(context.applicationContext).use {
-            it.exec(script, (timeoutSeconds * 1000).toInt().coerceIn(1, 30_000))
+        if (!assistantDown) {
+            val result = LocalAdb(context.applicationContext).use {
+                it.exec(script, (timeoutSeconds * 1000).toInt().coerceIn(1, 30_000))
+            }
+            // result == null 表示助手无应答；result.exit < 0 表示助手拒绝/执行失败
+            //（未激活、timed out、无 su 等）。两者都说明助手广播链路不可用，
+            // 回退到车机原生 setuid su 直连，并标记 assistantDown 避免后续重复等待广播超时。
+            if (result != null && result.exit >= 0) {
+                return result.exit to result.output.orEmpty()
+            }
+            assistantDown = true
         }
-        return result?.let { it.exit to it.output.orEmpty() } ?: (-1 to "cp unavailable")
+        return runSuDirect(script, timeoutSeconds)
+    }
+
+    /**
+     * Runs [script] as root through the device's setuid `su` binary directly, bypassing the
+     * assistant-app broadcast channel that [runSu] prefers. These head units ship a promptless
+     * setuid-root `su` (verified at /system/xbin/su), so the command runs without interaction.
+     * stdout and stderr are merged and drained on a side thread so a chatty command cannot fill
+     * the pipe; the caller's deadline is enforced regardless.
+     */
+    private fun runSuDirect(script: String, timeoutSeconds: Long): Pair<Int, String> {
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: IOException) {
+            return -1 to "direct su unavailable: ${e.message}"
+        }
+        val output = StringBuilder()
+        Thread({
+            try {
+                val reader = BufferedReader(InputStreamReader(process.inputStream))
+                reader.forEachLine { line -> synchronized(output) { output.append(line).append('\n') } }
+            } catch (_: IOException) {
+            }
+        }, "su-reader").apply { isDaemon = true }.start()
+
+        val deadline = System.nanoTime() + timeoutSeconds * 1_000_000_000L
+        var exit = -1
+        var exited = false
+        while (!exited && System.nanoTime() < deadline) {
+            try {
+                exit = process.exitValue()
+                exited = true
+            } catch (_: IllegalThreadStateException) {
+                Thread.sleep(100)
+            }
+        }
+        if (!exited) {
+            process.destroy()
+            return -1 to "direct su timed out"
+        }
+        Thread.sleep(50)
+        return exit to synchronized(output) { output.toString() }
     }
 
     // --- Hotspot via setWifiApEnabled reflection (app / saved) -----------------------------

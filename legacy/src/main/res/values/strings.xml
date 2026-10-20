@@ -47,13 +47,7 @@
     <string name="setting_network_mode">Network mode</string>
     <string name="network_mode_auto">Auto hotspot (recommended)</string>
     <string name="network_mode_direct">Wi-Fi Direct</string>
-    <string name="network_mode_router">Same router</string>
-    <string name="network_mode_reuse">Reuse existing hotspot</string>
     <string name="setting_takes_effect">Takes effect on the next connection</string>
-    <string name="setting_router_password">Router password</string>
-    <string name="value_unset">Not set</string>
-    <string name="value_set">Set</string>
-    <string name="router_password_summary">The WPA2 password your iPhone uses to join the router in same-router mode. Takes effect on the next connection.</string>
     <string name="caption_devices">Devices</string>
     <string name="no_paired_devices">No paired devices yet</string>
     <string name="no_paired_devices_summary">Once an iPhone is paired, it is listed here and can be removed.</string>
@@ -71,12 +65,10 @@
     <string name="action_save">Save</string>
     <string name="action_cancel">Cancel</string>
 
-    <!-- Ordered exactly like LegacySettings.networkModes (auto, direct, router, reuse) -->
+    <!-- Ordered exactly like LegacySettings.networkModes (auto, direct) -->
     <string-array name="network_mode_labels">
         <item>@string/network_mode_auto</item>
         <item>@string/network_mode_direct</item>
-        <item>@string/network_mode_router</item>
-        <item>@string/network_mode_reuse</item>
     </string-array>
     <!-- Index 0 = 30 FPS, 1 = 60 FPS, matching LegacySettingsActivity. -->
     <string-array name="fps_labels">

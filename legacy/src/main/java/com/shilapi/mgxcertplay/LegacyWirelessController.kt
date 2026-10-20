@@ -66,7 +66,7 @@ class LegacyWirelessController(
     /** An established AirPlay session ended: its control connection is gone for good. */
     private val onSessionEnded: () -> Unit = {},
     private val onHostUi: () -> Unit = {},
-    private val networkMode: String = "router",
+    private val networkMode: String = "auto",
 ) : Closeable {
 
     companion object {
@@ -324,7 +324,7 @@ class LegacyWirelessController(
             passphrase = readyEndpoint.password,
             channel = readyEndpoint.channel,
             security = Iap2WirelessSecurity.WPA_WPA2,
-            ipAddresses = listOf(readyEndpoint.address.hostAddress),
+            ipAddresses = readyEndpoint.addresses.map { it.hostAddress!!.substringBefore('%') },
             airPlayPort = setup.config.port,
             deviceIdentifier = setup.deviceId,
             publicKey = setup.identity.publicKeyHex,
@@ -358,19 +358,24 @@ class LegacyWirelessController(
             }
         }
 
-        val server = LegacyListenerBinder.bind(
-            InetSocketAddress(readyEndpoint.address, setup.config.port),
-            { closed.get() },
-            { attempt -> if (attempt == 1) log("AirPlay port busy; waiting up to 5s") },
-        )
-        // The listener is deliberately NOT registered in "resources": the shutdown path must
+        // Bind one listener per advertised address family so the iPhone's AirPlay SYN on
+        // 7100 is accepted whether it dials the IPv4 address or the scoped link-local IPv6.
+        // Same LAN topology binds one listener per family; phone-hotspot mode does the same.
+        // Each listener is deliberately NOT registered in "resources": the shutdown path must
         // never close it from another thread. On this head unit a ServerSocket closed by a
         // different thread can leave the LISTEN socket pinned in the kernel, and the next
         // bootstrap then dies with EADDRINUSE on bind. The accept thread owns the socket and
         // closes it in runAirPlayServer's finally block.
-        Thread({ runAirPlayServer(server, setup.config, setup.identity, setup.pairings, setup.mfi, setup.media) }, "legacy-airplay-server").apply {
-            isDaemon = true
-            start()
+        for (bindAddress in readyEndpoint.addresses) {
+            val server = LegacyListenerBinder.bind(
+                InetSocketAddress(bindAddress, setup.config.port),
+                { closed.get() },
+                { attempt -> if (attempt == 1) log("AirPlay port busy; waiting up to 5s") },
+            )
+            Thread({ runAirPlayServer(server, setup.config, setup.identity, setup.pairings, setup.mfi, setup.media) }, "legacy-airplay-server").apply {
+                isDaemon = true
+                start()
+            }
         }
 
         val mcLock = wifi.createMulticastLock("legacy-carplay-mdns").apply {
@@ -379,6 +384,12 @@ class LegacyWirelessController(
         }
         multicastLock = mcLock
 
+        // A single JmDNS registry bound to the primary IPv4 address. jmdns 3.6.3 binds UDP 5353
+        // on the wildcard address (getMulticastBindAddress returns InetSocketAddress(MDNS_PORT)
+        // on non-Windows) and never sets SO_REUSEADDR, so a second per-family JmDNS instance
+        // fails with EADDRINUSE on this head unit. The dual-stack reachability over IPv6 comes
+        // from the dual 0x4301 addresses above plus the dual AirPlay listeners; mDNS discovery
+        // keeps the original single-registry form the hotspot path already used.
         val dns = JmDNS.create(readyEndpoint.address, "DiPlay-Legacy")
         resources += dns
         dns.registerService(

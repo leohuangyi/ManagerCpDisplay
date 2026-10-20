@@ -526,10 +526,31 @@ object LegacyWirelessHost {
     }
 
     private fun findPhone(): BluetoothDevice? {
-        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return null
-        if (!adapter.isEnabled) return null
-        val bonded = adapter.bondedDevices ?: return null
-        return bonded.firstOrNull()
+        val adapter = BluetoothAdapter.getDefaultAdapter()
+        if (adapter == null) {
+            Log.w(TAG, "findPhone: BluetoothAdapter.getDefaultAdapter() returned null")
+            return null
+        }
+        if (!adapter.isEnabled) {
+            Log.w(TAG, "findPhone: adapter off (state=${adapter.state})")
+            return null
+        }
+        val bonded = runCatching { adapter.bondedDevices }
+            .onFailure { error -> Log.w(TAG, "findPhone: getBondedDevices threw", error) }
+            .getOrNull()
+        if (bonded == null) {
+            Log.w(TAG, "findPhone: bondedDevices == null (state=${adapter.state})")
+            return null
+        }
+        if (bonded.isEmpty()) {
+            Log.i(TAG, "findPhone: bondedDevices empty (state=${adapter.state})")
+            return null
+        }
+        val chosen = bonded.firstOrNull()
+        Log.i(TAG, "findPhone: ${bonded.size} bonded -> " +
+            bonded.joinToString { "${it.name ?: "<unnamed>"} (${it.address})" } +
+            " ; picked ${chosen?.name ?: "<unnamed>"} (${chosen?.address})")
+        return chosen
     }
 
     private fun align(value: Int): Int = (value / 2 * 2).coerceAtLeast(2)

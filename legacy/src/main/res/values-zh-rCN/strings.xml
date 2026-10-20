@@ -47,13 +47,7 @@
     <string name="setting_network_mode">网络模式</string>
     <string name="network_mode_auto">自动热点（推荐）</string>
     <string name="network_mode_direct">Wi-Fi 直连</string>
-    <string name="network_mode_router">同一路由器</string>
-    <string name="network_mode_reuse">复用已有热点</string>
     <string name="setting_takes_effect">更改将在下次连接时生效</string>
-    <string name="setting_router_password">路由器密码</string>
-    <string name="value_unset">未设置</string>
-    <string name="value_set">已设置</string>
-    <string name="router_password_summary">同一路由器模式下，iPhone 加入路由器所用的 WPA2 密码，更改将在下次连接时生效</string>
     <string name="caption_devices">设备管理</string>
     <string name="no_paired_devices">暂无已配对设备</string>
     <string name="no_paired_devices_summary">iPhone 连接配对后，会在此列出并可删除</string>

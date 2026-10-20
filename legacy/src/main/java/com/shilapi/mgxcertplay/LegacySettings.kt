@@ -9,9 +9,7 @@ import android.content.Context
  *
  *  - [LegacyWirelessHost] takes the network mode,
  *  - [LegacyWirelessController.prepareSession] takes fps, right-hand drive and HEVC,
- *  - [LegacyCarPlayActivity] takes auto-connect,
- *  - the router password lives in the "receiver-ui" file under "routerPassword", the same
- *    key [LegacyNetwork.prepareRouter] already reads.
+ *  - [LegacyCarPlayActivity] takes auto-connect.
  */
 object LegacySettings {
     private const val PREFS = "legacy_settings"
@@ -26,7 +24,7 @@ object LegacySettings {
     private const val KEY_HEVC = "hevc"
 
     /** The network modes [LegacyNetwork] understands; "app"/"saved" are broken on this firmware. */
-    val networkModes: List<String> = listOf("auto", "direct", "router", "reuse")
+    val networkModes: List<String> = listOf("auto", "direct")
 
     fun autoConnect(context: Context): Boolean =
         prefs(context).getBoolean(KEY_AUTO_CONNECT, true)
@@ -67,13 +65,6 @@ object LegacySettings {
         prefs(context).edit().putBoolean(KEY_HEVC, enabled).commit()
     }
 
-    fun routerPassword(context: Context): String =
-        routerPrefs(context).getString("routerPassword", "") ?: ""
-
-    fun setRouterPassword(context: Context, password: String) {
-        routerPrefs(context).edit().putString("routerPassword", password).commit()
-    }
-
     /** One paired iPhone. The prefs key is the identifier the iPhone sent during pairing;
      *  no friendly name is stored, so the label is its printable part or a short hex digest. */
     data class PairedDevice(val key: String, val label: String)
@@ -105,7 +96,4 @@ object LegacySettings {
 
     private fun prefs(context: Context) =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-
-    private fun routerPrefs(context: Context) =
-        context.getSharedPreferences("receiver-ui", Context.MODE_PRIVATE)
 }
