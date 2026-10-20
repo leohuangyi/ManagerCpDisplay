@@ -178,7 +178,7 @@ class CarPlayHostActivity : ComponentActivity() {
 
     // CH341 USB\VID_1A86&PID_5512&REV_0304 is the deployment-supplied bridge identity.
     private fun createRuntimeConfig(): CarPlayRuntimeConfig = CarPlayRuntimeConfig(
-        mfiTarget = mfiTarget,
+        mfiTarget = MfiTarget.LOCAL,
         ch341Devices = if (mfiTarget == MfiTarget.USB_CH341) {
             listOf(UsbDeviceId(0x1a86, 0x5512))
         } else {
@@ -210,7 +210,7 @@ class CarPlayHostActivity : ComponentActivity() {
         hostName = "diplay-" + DiPlayBootstrap.deviceId(airPlayIdentity).replace(":", "").lowercase(),
         hostMac = DiPlayBootstrap.deviceId(airPlayIdentity).split(":").map { it.toInt(16).toByte() }.toByteArray(),
         wirelessBluetoothDeviceAddress = DiPlayPreferences.phoneAddress(this),
-        transport = if (wirelessEnabled) CarPlayTransport.WIRELESS else CarPlayTransport.WIRED,
+        transport = CarPlayTransport.WIRELESS,
         wirelessHotspotMode = wirelessHotspotMode,
         wifiP2pPreferredChannel = AirPlayPersistence.loadWifiP2pPreferredChannel(this),
         manualHotspotSsid = manualHotspotSsid,
@@ -810,9 +810,6 @@ class CarPlayHostActivity : ComponentActivity() {
         MapMirrors.sink = mirrorSink
         MapMirrors.onChanged = mirrorsChanged
         languagePreferenceAtCreate = AppLocale.preference(this)
-        if (isIphoneUsbAttachment(intent)) {
-            AirPlayPersistence.saveWirelessEnabled(this, false)
-        }
         if (runCatching { DiPlayBootstrap.ensure(this, AirPlayPersistence.loadMfiTarget(this)) }.isFailure) {
             OwnScreenStart.start(this, Intent(this, DiPlayActivity::class.java), ::appendLog)
             finish(); return
@@ -926,7 +923,7 @@ class CarPlayHostActivity : ComponentActivity() {
      */
     private fun loadConnectionSettings() {
         hideBydCallPopup = AirPlayPersistence.loadHideBydCallPopup(this)
-        wirelessEnabled = AirPlayPersistence.loadWirelessEnabled(this)
+        wirelessEnabled = true
         mfiTarget = AirPlayPersistence.loadMfiTarget(this)
         mfiI2cPath = AirPlayPersistence.loadMfiI2cPath(this)
         remoteMfiServer = AirPlayPersistence.loadRemoteMfiServer(this)
@@ -1097,26 +1094,6 @@ class CarPlayHostActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        if (isIphoneUsbAttachment(intent)) {
-            if (wirelessEnabled) {
-                if (menuOpen) cancelSettingsEdits()
-                AirPlayPersistence.saveWirelessEnabled(this, false)
-                wirelessEnabled = false
-                wirelessPermissionsReady = true
-                if (controller != null) {
-                    restartCarPlay("switching to USB")
-                }
-                requestStartupPrerequisites()
-            } else if (controller == null) {
-                requestStartupPrerequisites()
-            }
-        }
-    }
-
-    private fun isIphoneUsbAttachment(intent: Intent): Boolean {
-        if (intent.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return false
-        val device = androidx.core.content.IntentCompat.getParcelableExtra(intent, UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
-        return device?.vendorId == IphoneUsbMatcher.APPLE_VENDOR_ID
     }
 
     override fun onStart() {
@@ -2859,29 +2836,14 @@ class CarPlayHostActivity : ComponentActivity() {
                 }
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
-        content.addView(
-            buildMfiTargetSection(),
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(14) },
-        )
-
         val wirelessRowResult = ConnectionSettingsSection.createWirelessCarPlayRow(
             context = this,
-            checked = wirelessEnabled,
+            checked = true,
             theme = settingsOverlayTheme,
-        ) { checked ->
-            if (wirelessEnabled == checked) return@createWirelessCarPlayRow
-            wirelessEnabled = checked
-            hotspotStatus = HotspotStatus(state = if (wirelessEnabled) getString(R.string.hotspot_state_stopped) else getString(R.string.hotspot_state_off))
-            updateHotspotStatusBlock()
-            appendLog(
-                "Wireless CarPlay ${if (wirelessEnabled) "enabled" else "disabled"}; " +
-                    "applies when settings close",
-            )
-            requestStartupPrerequisites()
+        ) {
+            // Wireless CarPlay is always on; the switch is read-only.
         }
+        wirelessRowResult.switch.isEnabled = false
         content.addView(
             wirelessRowResult.rowView,
             LinearLayout.LayoutParams(

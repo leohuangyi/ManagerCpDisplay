@@ -577,25 +577,6 @@ class CarPlayHostSettingsTest {
         assertEquals(1, field("restartGeneration"))
     }
 
-    // Switching to wireless puts the hotspot to use, so its details are checked although nobody touched them.
-    @Test fun switchingToWirelessChecksTheUnsetHotspot() {
-        AirPlayPersistence.saveWirelessEnabled(activity, false)
-        AirPlayPersistence.saveWirelessHotspotMode(activity, WirelessHotspotMode.MANUAL)
-        AirPlayPersistence.saveManualHotspotSsid(activity, "")
-        invoke("loadPersistedSettings")
-        attachController()
-        invoke("openSettingsMenu")
-        setField("wirelessEnabled", true)
-        saveButton().performClick()
-        assertTrue("Save stored wireless CarPlay without a hotspot", field("menuOpen") as Boolean)
-        assertEquals("connection", field("settingsMenuCategoryKey"))
-        val message = field("manualHotspotErrorView") as TextView
-        assertEquals(View.VISIBLE, message.visibility)
-        assertEquals(activity.getString(R.string.hotspot_ssid_is_required), message.text.toString())
-        assertFalse(AirPlayPersistence.loadWirelessEnabled(activity))
-        assertEquals(0, field("restartGeneration"))
-    }
-
     @Test fun aRejectedHotspotEditOpensTheConnectionPageWithItsMessage() {
         AirPlayPersistence.saveWirelessHotspotMode(activity, WirelessHotspotMode.MANUAL)
         AirPlayPersistence.saveManualHotspotSsid(activity, "Car hotspot")
@@ -729,41 +710,6 @@ class CarPlayHostSettingsTest {
         assertEquals(0, field("restartGeneration"))
     }
 
-    @Test fun authenticationChoicesOnlyExposeLocalAndCh341() {
-        invoke("openSettingsMenu")
-        val options = views(menu()).filterIsInstance<RadioButton>().filter { it.tag is MfiTarget }.toList()
-        assertEquals(listOf(MfiTarget.LOCAL, MfiTarget.USB_CH341), options.map { it.tag })
-        options.first().performClick()
-        invoke("cancelSettingsEdits")
-        assertEquals(MfiTarget.USB_CH341, AirPlayPersistence.loadMfiTarget(activity))
-        assertEquals(MfiTarget.USB_CH341, field("mfiTarget"))
-    }
-
-    @Test fun selectingLocalWithoutIdentityKeepsTheMenuAndSavedUsbChoice() {
-        attachController()
-        invoke("openSettingsMenu")
-        views(menu()).filterIsInstance<RadioButton>().first { it.tag == MfiTarget.LOCAL }.performClick()
-        invoke("saveSettingsAndReconnect")
-        assertTrue(field("menuOpen") as Boolean)
-        assertEquals(MfiTarget.USB_CH341, AirPlayPersistence.loadMfiTarget(activity))
-        assertEquals(View.VISIBLE, (field("mfiErrorView") as View).visibility)
-        assertEquals(0, field("restartGeneration"))
-    }
-
-    @Test fun switchingToUsbPersistsAndPassesUsbToTheRuntime() {
-        AirPlayPersistence.saveMfiTarget(activity, MfiTarget.LOCAL)
-        attachController()
-        invoke("openSettingsMenu")
-        views(menu()).filterIsInstance<RadioButton>().first { it.tag == MfiTarget.USB_CH341 }.performClick()
-        invoke("saveSettingsAndReconnect")
-        assertFalse(field("menuOpen") as Boolean)
-        assertEquals(MfiTarget.USB_CH341, AirPlayPersistence.loadMfiTarget(activity))
-        val config = invoke("createRuntimeConfig") as CarPlayRuntimeConfig
-        assertEquals(MfiTarget.USB_CH341, config.mfiTarget)
-        assertEquals(listOf(com.shilapi.xcertplay.transport.UsbDeviceId(0x1a86, 0x5512)), config.ch341Devices)
-        assertEquals(1, field("restartGeneration"))
-    }
-
     @Test fun localRuntimeDoesNotRequestCh341Devices() {
         AirPlayPersistence.saveMfiTarget(activity, MfiTarget.LOCAL)
         invoke("loadPersistedSettings")
@@ -788,75 +734,6 @@ class CarPlayHostSettingsTest {
         assertFalse((field("shuttingDown") as AtomicBoolean).get())
         assertFalse(activity.isFinishing)
         assertNull(shadowOf(activity).nextStartedActivity)
-    }
-
-    @Test fun iphoneAttachmentSwitchesToWiredTransportWithoutFinishing() {
-        org.robolectric.shadows.ShadowVpnService.setPrepareResult(null)
-        attachController()
-        AirPlayPersistence.saveWirelessEnabled(activity, true)
-        invoke("loadPersistedSettings")
-        val device = mock(UsbDevice::class.java)
-        `when`(device.vendorId).thenReturn(0x05ac)
-        val intent = Intent(UsbManager.ACTION_USB_DEVICE_ATTACHED).putExtra(UsbManager.EXTRA_DEVICE, device)
-        activity.javaClass.getDeclaredMethod("onNewIntent", Intent::class.java)
-            .apply { isAccessible = true }.invoke(activity, intent)
-        assertFalse(AirPlayPersistence.loadWirelessEnabled(activity))
-        assertFalse(field("wirelessEnabled") as Boolean)
-        assertTrue(field("vpnReady") as Boolean)
-        assertFalse((field("shuttingDown") as AtomicBoolean).get())
-        assertFalse(activity.isFinishing)
-        assertNull(shadowOf(activity).nextStartedActivity)
-    }
-
-    @Test fun switchingToUsbRequestsVpnConsentAndDoesNotRepeatPendingConsent() {
-        org.robolectric.shadows.ShadowVpnService.setPrepareResult(Intent("test.VPN_CONSENT"))
-        attachController()
-        AirPlayPersistence.saveWirelessEnabled(activity, true)
-        invoke("loadPersistedSettings")
-        setField("vpnReady", true) // Previously granted permission may have been revoked.
-        val device = mock(UsbDevice::class.java)
-        `when`(device.vendorId).thenReturn(0x05ac)
-        val intent = Intent(UsbManager.ACTION_USB_DEVICE_ATTACHED).putExtra(UsbManager.EXTRA_DEVICE, device)
-        val method = activity.javaClass.getDeclaredMethod("onNewIntent", Intent::class.java).apply { isAccessible = true }
-        method.invoke(activity, intent)
-        assertTrue(field("awaitingVpnConsent") as Boolean)
-        assertFalse(field("vpnReady") as Boolean)
-        assertNull(field("controller"))
-        assertEquals("test.VPN_CONSENT", shadowOf(activity).nextStartedActivityForResult.intent.action)
-        method.invoke(activity, intent)
-        assertNull(shadowOf(activity).nextStartedActivityForResult)
-        assertFalse(activity.isFinishing)
-    }
-
-    @Test fun usbAttachmentClosesSettingsAndRestartsInPlace() {
-        org.robolectric.shadows.ShadowVpnService.setPrepareResult(null)
-        attachController()
-        AirPlayPersistence.saveWirelessEnabled(activity, true)
-        invoke("loadPersistedSettings")
-        invoke("openSettingsMenu")
-        assertTrue(field("menuOpen") as Boolean)
-        val device = mock(UsbDevice::class.java)
-        `when`(device.vendorId).thenReturn(0x05ac)
-        val intent = Intent(UsbManager.ACTION_USB_DEVICE_ATTACHED).putExtra(UsbManager.EXTRA_DEVICE, device)
-        activity.javaClass.getDeclaredMethod("onNewIntent", Intent::class.java).apply { isAccessible = true }
-            .invoke(activity, intent)
-        assertFalse(field("menuOpen") as Boolean)
-        assertFalse(field("wirelessEnabled") as Boolean)
-        assertTrue(field("vpnReady") as Boolean)
-        assertNull(field("controller"))
-        assertEquals(1, field("restartGeneration"))
-        assertFalse(activity.isFinishing)
-    }
-
-    @Test fun onlyIphoneAttachmentSelectsWiredTransport() {
-        val method = activity.javaClass.getDeclaredMethod("isIphoneUsbAttachment", Intent::class.java)
-            .apply { isAccessible = true }
-        val device = mock(UsbDevice::class.java)
-        `when`(device.vendorId).thenReturn(0x05ac)
-        val attached = Intent(UsbManager.ACTION_USB_DEVICE_ATTACHED).putExtra(UsbManager.EXTRA_DEVICE, device)
-        assertEquals(true, method.invoke(activity, attached))
-        assertEquals(false, method.invoke(activity, Intent(UsbManager.ACTION_USB_DEVICE_ATTACHED)))
-        assertEquals(false, method.invoke(activity, Intent(UsbManager.ACTION_USB_DEVICE_DETACHED).putExtra(UsbManager.EXTRA_DEVICE, device)))
     }
 
     @Test fun cancelRestoresSafeAreaResetAfterTheWindowChangesSize() {

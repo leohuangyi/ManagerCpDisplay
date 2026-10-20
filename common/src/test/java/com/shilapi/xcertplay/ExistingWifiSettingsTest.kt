@@ -87,10 +87,6 @@ class ExistingWifiSettingsTest {
         val permissions = CarPlayHostActivity::class.java.getDeclaredMethod("requiredWirelessPermissions")
             .apply { isAccessible = true }.invoke(host) as List<*>
         assertTrue(permissions.isEmpty()) // Manual SSID input must work without fine location on API 29.
-        AirPlayPersistence.saveExistingWifiCredentials(app, "", "")
-        AirPlayPersistence.saveWirelessEnabled(app, false)
-        CarPlayHostActivity::class.java.getDeclaredMethod("loadPersistedSettings").apply { isAccessible = true }.invoke(host)
-        assertEquals(CarPlayTransport.WIRED, runtime().transport)
     }
 
     private fun controls(): List<View> {

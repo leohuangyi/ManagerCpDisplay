@@ -79,40 +79,6 @@ class CarPlayControllerUsbServiceTest {
         assertEquals(2, context.unregistered)
     }
 
-    @Test fun availableWirelessCh341StillWaitsForMfiAndClosesItsPermissionReceiver() {
-        val context = UsbContext(true)
-        val controller = controller(context, CarPlayTransport.WIRELESS, MfiTarget.USB_CH341)
-        controller.start()
-        shadowOf(Looper.getMainLooper()).idle()
-        assertTrue(statuses.contains(CarPlayStatus.WaitingForMfi))
-        assertEquals(1, context.receivers.size)
-        assertFalse(context.receivers.values.any { it.hasAction("android.hardware.usb.action.USB_DEVICE_ATTACHED") })
-        controller.close()
-        assertTrue(controller.awaitClosed(2_000))
-        assertEquals(0, context.receivers.size)
-        assertEquals(1, context.unregistered)
-    }
-
-    @Test fun aMissingCh341IsReportedWithWhatAndroidListsOnce() {
-        // #792: after a session the adapter was gone, and the report said only "MFi coprocessor not present".
-        val context = UsbContext(true)
-        val usb = context.getSystemService(UsbManager::class.java)
-        shadowOf(usb).addOrUpdateUsbDevice(usbDevice(0x05ac, 0x12a8, "/dev/bus/usb/001/002"), false)
-        val logs = mutableListOf<String>()
-        val controller = controller(context, CarPlayTransport.WIRELESS, MfiTarget.USB_CH341, logs)
-        controller.start()
-        shadowOf(Looper.getMainLooper()).idle()
-        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(5))
-        assertEquals(listOf("mfi CH341 not listed by Android; USB devices=[05ac:12a8 /dev/bus/usb/001/002]"),
-            logs.filter { it.startsWith("mfi CH341") })
-
-        // The adapter comes back: the next poll names it and asks for access.
-        shadowOf(usb).addOrUpdateUsbDevice(usbDevice(0x1a86, 0x7523, "/dev/bus/usb/001/005"), false)
-        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(3))
-        assertEquals("mfi CH341 listed 1a86:7523 /dev/bus/usb/001/005", logs.filter { it.startsWith("mfi CH341") }.last())
-        assertTrue(statuses.contains(CarPlayStatus.RequestingMfiPermission))
-    }
-
     @Test fun aMissingIphoneIsReportedWithWhatAndroidListsOnce() {
         // #763: the report said only "iPhone USB device not present", whether Android saw the port or not.
         val context = UsbContext(true)

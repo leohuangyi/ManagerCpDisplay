@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!-- Apple USB vendor id (0x05ac = 1452). Refine product ids in a later device-config stage. -->
-<resources>
-    <usb-device vendor-id="1452" />
-</resources>

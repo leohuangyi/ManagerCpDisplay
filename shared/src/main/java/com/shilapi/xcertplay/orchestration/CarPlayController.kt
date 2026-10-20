@@ -881,16 +881,21 @@ class CarPlayController(
         when (config.mfiTarget) {
             MfiTarget.LOCAL -> openLocalMfi(offlineDirectory)
             MfiTarget.USB_CH341 -> {
-                debugLog("mfi discovery backend=CH341 devices=${config.ch341Devices}")
-                val host = ch341Host ?: Ch341UsbHost(
-                    appContext,
-                    requireUsbManager(),
-                    Ch341DeviceMatcher(config.ch341Devices),
-                ).also {
-                    ch341Host = it
-                    ch341PermissionCloseable = it.registerPermissionReceiver(::onCh341Permission)
+                if (config.transport == CarPlayTransport.WIRELESS) {
+                    debugLog("skip CH341 USB MFi in wireless mode")
+                    openLocalMfi(offlineDirectory)
+                } else {
+                    debugLog("mfi discovery backend=CH341 devices=${config.ch341Devices}")
+                    val host = ch341Host ?: Ch341UsbHost(
+                        appContext,
+                        requireUsbManager(),
+                        Ch341DeviceMatcher(config.ch341Devices),
+                    ).also {
+                        ch341Host = it
+                        ch341PermissionCloseable = it.registerPermissionReceiver(::onCh341Permission)
+                    }
+                    checkCh341Mfi(host)
                 }
-                checkCh341Mfi(host)
             }
             MfiTarget.I2C -> {
                 debugLog("mfi discovery backend=Linux I2C path=${config.linuxI2cPath}")
