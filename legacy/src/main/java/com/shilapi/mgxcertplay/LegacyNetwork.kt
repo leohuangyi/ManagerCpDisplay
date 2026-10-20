@@ -426,6 +426,11 @@ class LegacyNetwork(
     fun restoreAfterCarPlay(): Boolean {
         val (rc, out) = runOp(OP_WIFI_RESTORE, timeoutSeconds = 25)
         log("Wifi restart rc=$rc out=${out.trim().take(300)}")
+        // 无论 Wi-Fi 是否还原成功，都再走原车 mcreset 重置媒体核心（stop jmcs -> stop mdnsd ->
+        // kill mcservice -> start mdnsd -> start jmcs），把 DiPlay 退出后残留的 iAP2/USB host
+        // 状态机拉回干净状态，使原车有线 CarPlay 重新可 claim。
+        val (mrc, mout) = runOp(OP_MC_RESET, timeoutSeconds = 15)
+        log("Media core reset rc=$mrc out=${mout.trim().take(200)}")
         return rc == 0
     }
 
@@ -440,5 +445,6 @@ class LegacyNetwork(
         const val OP_HOTSPOT_DOWN = "n2"
         const val OP_RMEM = "n3"
         const val OP_WIFI_RESTORE = "n4"
+        const val OP_MC_RESET = "n5"
     }
 }

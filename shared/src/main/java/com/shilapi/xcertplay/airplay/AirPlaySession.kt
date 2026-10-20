@@ -163,6 +163,41 @@ class AirPlaySession(
         return torn.isNotEmpty()
     }
 
+    /**
+     * Final-exit graceful goodbye, sent before [close] tears down the RTSP socket. CarPlay
+     * carries its screen and data over AirPlay RTSP where this accessory is the server, so there
+     * is no accessory-initiated RTSP TEARDOWN request; the graceful equivalent is the changeModes
+     * borrow of the main screen (Apple's "hidden screen" pattern) plus a local stream release
+     * ([suspendScreenStreams]). Sending it first lets the iPhone stop the stream itself and leave
+     * its CarPlay state machine cleanly instead of only noticing the abrupt socket close later,
+     * which is the window where it can refuse the next wired or wireless session. Safe to call from
+     * any thread and idempotent; it no-ops once the session is closed or the event channel is gone.
+     */
+    fun endSession(): Boolean {
+        if (closed.get()) return false
+        val stopped = sendCommand(
+            linkedMapOf(
+                "type" to "changeModes",
+                "params" to linkedMapOf(
+                    "resources" to listOf(
+                        linkedMapOf<String, Any?>(
+                            "resourceID" to 1,             // CarPlay main screen
+                            "transferType" to 3,           // borrow
+                            "transferPriority" to 500,     // UserInitiated
+                            "unborrowConstraint" to 1000,  // Never
+                            "borrowID" to "displayOff",    // Apple's predefined hidden-screen id
+                        ),
+                    ),
+                ),
+            ),
+        )
+        val suspended = suspendScreenStreams()
+        if (stopped || suspended) {
+            debugLog("airplay end session: borrowSent=$stopped streamsSuspended=$suspended")
+        }
+        return stopped || suspended
+    }
+
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         mainScreenToken = null
@@ -342,7 +377,8 @@ class AirPlaySession(
             "Content-Type: $PLIST_CONTENT_TYPE\r\n" +
             "Content-Length: ${body.size}\r\n" +
             "CSeq: $eventCseq\r\n\r\n"
-        trace("airplay event tx headers=$head bodyHex=${body.toHex()}")
+        // 性能：body 转 hex 开销大，注释此调试日志
+        // trace("airplay event tx headers=$head bodyHex=${body.toHex()}")
         return try {
             val bytes = cipher.encrypt(head.toByteArray(Charsets.US_ASCII) + body)
             val output = socket.getOutputStream()
@@ -503,10 +539,11 @@ class AirPlaySession(
                         AirPlayControlDiagnostics.request(request.method, request.path, request.body.size),
                         false,
                     )
-                    trace(
-                        "airplay control rx headers=${request.headers} " +
-                            "bodyHex=${request.body.toHex()}",
-                    )
+                    // 性能：body 转 hex 开销大，注释此调试日志
+                    // trace(
+                    //     "airplay control rx headers=${request.headers} " +
+                    //         "bodyHex=${request.body.toHex()}",
+                    // )
                     val response = try {
                         handle(request)
                     } catch (error: Exception) {
@@ -526,7 +563,8 @@ class AirPlaySession(
                         false,
                     )
                     val wire = RtspMessage.buildResponse(request, response)
-                    trace("airplay control tx wireHex=${wire.toHex()}")
+                    // 性能：wire 转 hex 开销大，注释此调试日志
+                    // trace("airplay control tx wireHex=${wire.toHex()}")
                     output.write(cipher?.encrypt(wire) ?: wire)
                     if (cipher == null && pairVerify.controlKeys != null) {
                         val keys = pairVerify.controlKeys!!
@@ -675,7 +713,8 @@ class AirPlaySession(
             val responseStreams = handleStreams(streams)
             debugLog("airplay SETUP response streams=$responseStreams")
             val body = BplistCodec.encode(linkedMapOf("streams" to responseStreams))
-            trace("airplay SETUP response bplistHex=${body.toHex()}")
+            // 性能：body 转 hex 开销大，注释此调试日志
+            // trace("airplay SETUP response bplistHex=${body.toHex()}")
             return RtspMessage.Response(headers = mapOf("Content-Type" to PLIST_CONTENT_TYPE), body = body)
         }
 
@@ -814,7 +853,8 @@ class AirPlaySession(
             "airplay TEARDOWN types=${types ?: "all"} activeBefore=$activeStreams " +
                 "body=${request.body.size} bytes payload=$decodedBody",
         )
-        trace("airplay TEARDOWN raw${request.body.size}Hex=${request.body.toHex()}")
+        // 性能：body 转 hex 开销大，注释此调试日志
+        // trace("airplay TEARDOWN raw${request.body.size}Hex=${request.body.toHex()}")
 
         // Restore wheel input before releasing media resources, which may take time to close.
         if (types == null || STREAM_TYPE_MAIN_SCREEN in types) mainScreenToken = null
@@ -963,20 +1003,23 @@ class AirPlaySession(
                         // Replies to our own POST /command (SentResponses); the reply body carries the
                         // command status ("status" key). Keep the evidence: it shows whether the iPhone
                         // accepted or rejected e.g. a changeModes borrow.
-                        debugLog(
-                            "airplay event reply ${message.method} cseq=${message.headers["cseq"] ?: "-"} body=${message.body.size} bodyHex=${message.body.toHex()}",
-                        )
+                        // 性能：body 转 hex 开销大，注释此调试日志
+                        // debugLog(
+                        //     "airplay event reply ${message.method} cseq=${message.headers["cseq"] ?: "-"} body=${message.body.size} bodyHex=${message.body.toHex()}",
+                        // )
                         continue
                     }
                     debugLog(
                         "airplay event rx ${message.method} ${message.path} cseq=${message.headers["cseq"] ?: "-"} body=${message.body.size}",
                     )
                     val response = RtspMessage.buildResponse(message, RtspMessage.Response(status = 200))
-                    trace(
-                        "airplay event rx headers=${message.headers} " +
-                            "bodyHex=${message.body.toHex()}",
-                    )
-                    trace("airplay event tx wireHex=${response.toHex()}")
+                    // 性能：body 转 hex 开销大，注释此调试日志
+                    // trace(
+                    //     "airplay event rx headers=${message.headers} " +
+                    //         "bodyHex=${message.body.toHex()}",
+                    // )
+                    // 性能：wire 转 hex 开销大，注释此调试日志
+                    // trace("airplay event tx wireHex=${response.toHex()}")
                     synchronized(eventWriteLock) {
                         output.write(cipher.encrypt(response))
                         output.flush()

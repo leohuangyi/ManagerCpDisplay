@@ -1,5 +1,6 @@
 package com.shilapi.mgxcertplay
 
+import android.bluetooth.BluetoothA2dp
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothHeadset
@@ -75,8 +76,16 @@ class LegacyWirelessController(
         private const val SOURCE_VERSION = "950.7.1"
         // The stale RFCOMM channel of a just-closed bootstrap can take several seconds to
         // clear in this head unit's Bluetooth service, so give the connect a wide window.
-        private const val RFCOMM_CONNECT_ATTEMPTS = 5
+        private const val RFCOMM_CONNECT_ATTEMPTS = 6
         private const val RFCOMM_CONNECT_RETRY_DELAY_MS = 2000L
+        // EBUSY ("Device or resource busy") means the OEM wired CarPlay stack still holds a
+        // live RFCOMM/L2CAP link; wait for BlueZ to tear it down before reconnecting.
+        private const val RFCOMM_BUSY_RETRY_DELAY_MS = 3000L
+        // "Service discovery failed" means the iPhone has not yet switched to wireless iAP2
+        // mode (it is still leaving its wired session); give the state machine longer to settle.
+        private const val RFCOMM_SDP_RETRY_DELAY_MS = 4000L
+        // Settle time after disconnecting HFP/A2DP before opening the CarPlay RFCOMM channel.
+        private const val BLUETOOTH_PROFILE_SETTLE_MS = 2500L
         /** AirPlay resource id and changeModes transfer types for the CarPlay main screen. */
         private const val RESOURCE_ID_MAIN_SCREEN = 1
         private const val TRANSFER_BORROW = 3
@@ -96,6 +105,8 @@ class LegacyWirelessController(
     /** The live RFCOMM control stream/session of the Bluetooth bootstrap, closed by [closeRfcomm]. */
     @Volatile private var rfcommStream: BluetoothRfcommDuplexStream? = null
     @Volatile private var rfcommSession: Iap2Session? = null
+    /** The iPhone this controller bootstrapped against, used to tear down Bluetooth profiles on exit. */
+    @Volatile private var phone: BluetoothDevice? = null
     private val resources = CopyOnWriteArrayList<Closeable>()
     @Volatile private var bootstrapThread: Thread? = null
     private val trackThreads = CopyOnWriteArrayList<Thread>()
@@ -241,6 +252,7 @@ class LegacyWirelessController(
     }
 
     private fun runBootstrap(phone: BluetoothDevice) {
+        this.phone = phone
         val adapter = BluetoothAdapter.getDefaultAdapter()
             ?: throw IllegalStateException("Android Bluetooth is unavailable")
         check(adapter.isEnabled) { "please enable Bluetooth first" }
@@ -481,48 +493,69 @@ class LegacyWirelessController(
     }
 
     /**
-     * Disconnects the OEM Hands-Free Profile from the iPhone before opening the CarPlay RFCOMM
-     * channel. The head unit's HFP profile holds its own RFCOMM connection, so BlueZ rejects a
-     * second RFCOMM connect with EBUSY. Uses the public BluetoothHeadset API, no root required.
+     * Disconnects the OEM Hands-Free and A2DP profiles from the iPhone before opening the CarPlay
+     * RFCOMM channel. The wired CarPlay stack leaves both RFCOMM (HFP) and L2CAP (A2DP) links live
+     * after USB unplug, and BlueZ rejects a fresh RFCOMM connect with EBUSY until they settle. The
+     * public profile proxies may report no "connected" device while the underlying channel is still
+     * tearing down, so both profiles are disconnected and a fixed settle window is always waited.
      */
     private fun disconnectHfp(phone: BluetoothDevice) {
+        disconnectProfile(phone, BluetoothProfile.HEADSET, "HFP")
+        disconnectProfile(phone, BluetoothProfile.A2DP, "A2DP")
+        try {
+            Thread.sleep(BLUETOOTH_PROFILE_SETTLE_MS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    /** Disconnects [phone] from one Bluetooth profile via the public (@hide) disconnect method. */
+    private fun disconnectProfile(phone: BluetoothDevice, profile: Int, label: String) {
         val adapter = BluetoothAdapter.getDefaultAdapter() ?: return
         val latch = CountDownLatch(1)
-        var headset: BluetoothHeadset? = null
+        var proxy: BluetoothProfile? = null
         val listener = object : BluetoothProfile.ServiceListener {
-            override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
-                if (profile == BluetoothProfile.HEADSET) headset = proxy as BluetoothHeadset
+            override fun onServiceConnected(connectedProfile: Int, connectedProxy: BluetoothProfile) {
+                proxy = connectedProxy
                 latch.countDown()
             }
 
-            override fun onServiceDisconnected(profile: Int) {
+            override fun onServiceDisconnected(disconnectedProfile: Int) {
                 latch.countDown()
             }
         }
         try {
-            if (!adapter.getProfileProxy(context, listener, BluetoothProfile.HEADSET)) {
-                log("HFP proxy request rejected; skipping HFP disconnect")
+            if (!adapter.getProfileProxy(context, listener, profile)) {
+                log("$label proxy request rejected; skipping disconnect")
                 return
             }
-            if (!latch.await(3, TimeUnit.SECONDS) || headset == null) {
-                log("HFP proxy unavailable; skipping HFP disconnect")
+            if (!latch.await(3, TimeUnit.SECONDS) || proxy == null) {
+                log("$label proxy unavailable; skipping disconnect")
                 return
             }
-            val connected = headset!!.connectedDevices
+            val connected = proxy!!.connectedDevices
             if (connected.contains(phone)) {
-                log("Disconnecting HFP from iPhone")
-                // BluetoothHeadset.disconnect(BluetoothDevice) is @hide, so invoke it reflectively.
-                BluetoothHeadset::class.java.getMethod("disconnect", BluetoothDevice::class.java)
-                    .invoke(headset, phone)
-                Thread.sleep(800)
-                log("HFP disconnect requested")
+                log("Disconnecting $label from iPhone")
+                val method = when (proxy) {
+                    is BluetoothHeadset ->
+                        BluetoothHeadset::class.java.getMethod("disconnect", BluetoothDevice::class.java)
+                    is BluetoothA2dp ->
+                        BluetoothA2dp::class.java.getMethod("disconnect", BluetoothDevice::class.java)
+                    else -> null
+                }
+                if (method == null) {
+                    log("$label lacks a reflective disconnect; skipping")
+                    return
+                }
+                method.invoke(proxy, phone)
+                log("$label disconnect requested")
             } else {
-                log("HFP not connected to iPhone; nothing to disconnect")
+                log("$label not connected to iPhone; nothing to disconnect")
             }
         } catch (error: Throwable) {
-            log("HFP disconnect failed: ${error.javaClass.simpleName}: ${error.message}")
+            log("$label disconnect failed: ${error.javaClass.simpleName}: ${error.message}")
         } finally {
-            headset?.let { runCatching { adapter.closeProfileProxy(BluetoothProfile.HEADSET, it) } }
+            proxy?.let { runCatching { adapter.closeProfileProxy(profile, it) } }
         }
     }
 
@@ -605,10 +638,20 @@ class LegacyWirelessController(
                     log(if (attempt > 1) "Bluetooth RFCOMM connected on attempt $attempt" else "Bluetooth RFCOMM connected")
                 } catch (e: IOException) {
                     runCatching { candidate.close() }
+                    val message = e.message ?: ""
+                    // EBUSY and SDP failure need different back-offs: EBUSY means a stale OEM
+                    // RFCOMM/L2CAP link is still clearing, SDP failure means the iPhone has not
+                    // entered wireless iAP2 mode yet. Both deserve a longer wait than a generic
+                    // connect error rather than a blind fixed retry.
+                    val delay = when {
+                        message.contains("busy", ignoreCase = true) -> RFCOMM_BUSY_RETRY_DELAY_MS
+                        message.contains("Service discovery", ignoreCase = true) -> RFCOMM_SDP_RETRY_DELAY_MS
+                        else -> RFCOMM_CONNECT_RETRY_DELAY_MS
+                    }
                     if (!closed.get() && attempt < RFCOMM_CONNECT_ATTEMPTS) {
-                        log("Bluetooth RFCOMM attempt $attempt failed (${e.message}); retrying")
+                        log("Bluetooth RFCOMM attempt $attempt failed ($message); retrying in ${delay}ms")
                         try {
-                            Thread.sleep(RFCOMM_CONNECT_RETRY_DELAY_MS)
+                            Thread.sleep(delay)
                         } catch (_: InterruptedException) {
                             return
                         }
@@ -763,6 +806,12 @@ class LegacyWirelessController(
         // Covers the bootstrap that raced the first call and published its stream only after
         // it: a second close registers the fresh socket and collapses the 60s recv wait.
         closeRfcomm()
+        // Graceful goodbye first: tell the iPhone (changeModes borrow + local stream teardown)
+        // that this CarPlay session is ending before the RTSP socket is closed abruptly. This
+        // lets it stop the screen stream itself and exit its CarPlay state machine cleanly, so it
+        // can accept the next wired or wireless session right away instead of only noticing the
+        // socket drop later.
+        sessions.forEach { runCatching { it.endSession() } }
         activeSession = null
         sessions.forEach { runCatching { it.close() } }
         sessions.clear()
@@ -774,6 +823,15 @@ class LegacyWirelessController(
         wifiLocks.clear()
         resources.forEach { runCatching { it.close() } }
         resources.clear()
+        // Tear down any Bluetooth profiles still pointing at the iPhone so the OEM wired
+        // CarPlay stack can re-claim the device immediately after exit. The RFCOMM channel is
+        // already closed above; this clears the HFP/A2DP links the bootstrap disconnected, so
+        // the phone's Bluetooth state is clean rather than half-connected when the OEM stack
+        // retries (a stale link is what surfaced as "bt_transport_open: INCORRECT STATE").
+        phone?.let {
+            disconnectProfile(it, BluetoothProfile.HEADSET, "HFP")
+            disconnectProfile(it, BluetoothProfile.A2DP, "A2DP")
+        }
     }
 
     /**
