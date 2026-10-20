@@ -6,11 +6,8 @@ import android.net.wifi.WifiManager
 import android.net.wifi.p2p.WifiP2pGroup
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Looper
-import java.io.BufferedReader
 import java.io.Closeable
 import java.io.File
-import java.io.IOException
-import java.io.InputStreamReader
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.NetworkInterface
@@ -53,7 +50,6 @@ class LegacyNetwork(
     private var apWasEnabled = false
     private var changedAp = false
     private var hotspotStartedByUs = false
-    @Volatile private var assistantDown = false
 
     fun prepare(): Endpoint = when (networkMode) {
         "direct" -> prepareDirect()
@@ -152,13 +148,13 @@ class LegacyNetwork(
 
         // Heavy path: one su call covers the root check, the firmware's hotspot profile and
         // the rmem_max raise. Three separate su spawns cost about a second each on this unit.
-        val (prepRc, prepOut) = runSu(SU_HOTSPOT_PREP, timeoutSeconds = 8)
+        val (prepRc, prepOut) = runOp(OP_HOTSPOT_PREP, timeoutSeconds = 8)
         if (prepRc != 0 || !prepOut.contains("uid=0")) {
             throw IllegalStateException("H a n r请检查权限是否开启")
         }
         val (ssid, password, channel) = parseAndCacheHotspotProfile(prepOut)
 
-        val (upRc, upOut) = runSu(hotspotUpScript(ssid, password, channel))
+        val (upRc, upOut) = runOp(OP_HOTSPOT_UP, "$ssid\n$password\n$channel")
         log("Hotspot up rc=$upRc out=${upOut.trim().take(300)}")
         check(upRc == 0) { "Hotspot startup failed rc=$upRc" }
         // The script's exit code only reflects dnsmasq, its last command: hostapd can
@@ -171,30 +167,6 @@ class LegacyNetwork(
             ?: throw IllegalStateException("Network IPv4 address unavailable")
         log("Network mode=$networkMode interface=${iface.name} ready=true")
         return Endpoint(ssid, password, channel, iface, address)
-    }
-
-    /**
-     * Builds the su script that brings the hotspot up with an 802.11n/WMM profile taken from
-     * the values read out of the firmware's hostapd.conf (defaults when unreadable). The profile
-     * goes to a private file: see SU_HOTSPOT_UP_PREFIX for why /data/misc/wifi cannot be used.
-     */
-    private fun hotspotUpScript(ssid: String, password: String, channel: Int): String {
-        val s = ssid.replace("'", "'\\''")
-        val p = password.replace("'", "'\\''")
-        return SU_HOTSPOT_UP_PREFIX +
-            "echo interface=wlan0 > /data/local/tmp/diplay_hostapd.conf; " +
-            "echo driver=nl80211 >> /data/local/tmp/diplay_hostapd.conf; " +
-            "echo ssid='$s' >> /data/local/tmp/diplay_hostapd.conf; " +
-            "echo hw_mode=g >> /data/local/tmp/diplay_hostapd.conf; " +
-            "echo channel=$channel >> /data/local/tmp/diplay_hostapd.conf; " +
-            "echo ieee80211n=1 >> /data/local/tmp/diplay_hostapd.conf; " +
-            "echo ht_capab=[SHORT-GI-20] >> /data/local/tmp/diplay_hostapd.conf; " +
-            "echo wmm_enabled=1 >> /data/local/tmp/diplay_hostapd.conf; " +
-            "echo wpa=2 >> /data/local/tmp/diplay_hostapd.conf; " +
-            "echo wpa_passphrase='$p' >> /data/local/tmp/diplay_hostapd.conf; " +
-            "echo wpa_key_mgmt=WPA-PSK >> /data/local/tmp/diplay_hostapd.conf; " +
-            "echo wpa_pairwise=CCMP >> /data/local/tmp/diplay_hostapd.conf; " +
-            SU_HOTSPOT_UP_TAIL
     }
 
     /**
@@ -211,7 +183,7 @@ class LegacyNetwork(
         if (cachedSsid != null && cachedPassword != null && cachedChannel > 0) {
             return Triple(cachedSsid, cachedPassword, cachedChannel)
         }
-        val (rc, out) = runSu(SU_HOTSPOT_PREP, timeoutSeconds = 8)
+        val (rc, out) = runOp(OP_HOTSPOT_PREP, timeoutSeconds = 8)
         if (rc != 0) return Triple("DiPlay-Legacy", "diplay1234", 6)
         return parseAndCacheHotspotProfile(out)
     }
@@ -249,66 +221,22 @@ class LegacyNetwork(
      * Best effort: any su failure is logged and the connection still works with the cap.
      */
     private fun raiseRmemMax() {
-        val (rc, out) = runSu(SU_RMEM_MAX, timeoutSeconds = 5)
+        val (rc, out) = runOp(OP_RMEM, timeoutSeconds = 5)
         if (rc != 0) log("rmem_max raise failed rc=$rc out=${out.trim().take(120)}")
     }
 
-    /** Runs a rooted script in the assistant app, reached over broadcast (no local su anymore). */
-    private fun runSu(script: String, timeoutSeconds: Long = 20): Pair<Int, String> {
-        if (!assistantDown) {
-            val result = LocalAdb(context.applicationContext).use {
-                it.exec(script, (timeoutSeconds * 1000).toInt().coerceIn(1, 30_000))
-            }
-            // result == null 表示助手无应答；result.exit < 0 表示助手拒绝/执行失败
-            //（未激活、timed out、无 su 等）。两者都说明助手广播链路不可用，
-            // 回退到车机原生 setuid su 直连，并标记 assistantDown 避免后续重复等待广播超时。
-            if (result != null && result.exit >= 0) {
-                return result.exit to result.output.orEmpty()
-            }
-            assistantDown = true
-        }
-        return runSuDirect(script, timeoutSeconds)
-    }
-
     /**
-     * Runs [script] as root through the device's setuid `su` binary directly, bypassing the
-     * assistant-app broadcast channel that [runSu] prefers. These head units ship a promptless
-     * setuid-root `su` (verified at /system/xbin/su), so the command runs without interaction.
-     * stdout and stderr are merged and drained on a side thread so a chatty command cannot fill
-     * the pipe; the caller's deadline is enforced regardless.
+     * Runs a privileged command through the assistant app's opcode channel. This app only
+     * sends an opaque [op] token plus optional newline-joined [args]; the real shell script
+     * lives in the assistant's CpManager, so decompiling this APK does not reveal the hotspot
+     * wiring. Returns (exit, output): -1 means the assistant did not answer.
      */
-    private fun runSuDirect(script: String, timeoutSeconds: Long): Pair<Int, String> {
-        val process = try {
-            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
-        } catch (e: IOException) {
-            return -1 to "direct su unavailable: ${e.message}"
+    private fun runOp(op: String, args: String? = null, timeoutSeconds: Long = 20): Pair<Int, String> {
+        val result = LocalAdb(context.applicationContext).use {
+            it.execOp(op, args, (timeoutSeconds * 1000).toInt().coerceIn(1, 30_000))
         }
-        val output = StringBuilder()
-        Thread({
-            try {
-                val reader = BufferedReader(InputStreamReader(process.inputStream))
-                reader.forEachLine { line -> synchronized(output) { output.append(line).append('\n') } }
-            } catch (_: IOException) {
-            }
-        }, "su-reader").apply { isDaemon = true }.start()
-
-        val deadline = System.nanoTime() + timeoutSeconds * 1_000_000_000L
-        var exit = -1
-        var exited = false
-        while (!exited && System.nanoTime() < deadline) {
-            try {
-                exit = process.exitValue()
-                exited = true
-            } catch (_: IllegalThreadStateException) {
-                Thread.sleep(100)
-            }
-        }
-        if (!exited) {
-            process.destroy()
-            return -1 to "direct su timed out"
-        }
-        Thread.sleep(50)
-        return exit to synchronized(output) { output.toString() }
+        return if (result == null) -1 to "assistant unreachable"
+        else result.exit to result.output.orEmpty()
     }
 
     // --- Hotspot via setWifiApEnabled reflection (app / saved) -----------------------------
@@ -456,7 +384,7 @@ class LegacyNetwork(
 
     override fun close() {
         if (hotspotStartedByUs) {
-            runSu(SU_HOTSPOT_DOWN)
+            runOp(OP_HOTSPOT_DOWN)
         }
         val channel = p2pChannel
         val p2pManager = p2p
@@ -496,10 +424,7 @@ class LegacyNetwork(
      * [close]'s own teardown is harmless; the final `svc wifi enable` decides the exit code.
      */
     fun restoreAfterCarPlay(): Boolean {
-        val (rc, out) = runSu(
-            SU_HOTSPOT_DOWN + "; svc wifi disable; sleep 1; svc wifi enable",
-            timeoutSeconds = 25,
-        )
+        val (rc, out) = runOp(OP_WIFI_RESTORE, timeoutSeconds = 25)
         log("Wifi restart rc=$rc out=${out.trim().take(300)}")
         return rc == 0
     }
@@ -507,60 +432,13 @@ class LegacyNetwork(
     private companion object {
         const val AP_STATE_ENABLED = 13
 
-        // One su round-trip for the three pre-flight steps the heavy path used to run
-        // separately: the root check, the firmware hotspot profile read and the rmem_max
-        // raise. Each su spawn costs about a second on the MY16ADA; rmem_max goes last so
-        // this script's exit code reflects it.
-        const val SU_HOTSPOT_PREP =
-            "id; " +
-                "cat /data/misc/wifi/hostapd.conf 2>/dev/null; " +
-                "echo 2097152 > /proc/sys/net/core/rmem_max"
-
-        // The miwifi kernel boots with net.core.rmem_max=131071, capping SO_RCVBUF at
-        // ~256 KB and shrinking the SYN-time window scale. Raise it before the video
-        // listener binds so the 2 MB screen-stream receive window is actually advertised.
-        const val SU_RMEM_MAX = "echo 2097152 > /proc/sys/net/core/rmem_max"
-
-        // Verified on the device's toolbox-only shell: no awk/xargs/killall, so leftovers
-        // are stopped through a validated dnsmasq pid file and a /proc scan for hostapd.
-        // The dnsmasq kill checks /proc/<pid>/cmdline first: the pid file may be stale (PID
-        // recycled to an unrelated process) or polluted by a shell user, and a blind kill
-        // could SIGTERM an innocent process. It must never touch its own shell either.
-        const val SU_KILL_DNSMASQ = "p=\$(cat /data/local/tmp/dnsmasq.pid 2>/dev/null); " +
-            "if [ -n \"\$p\" ] && [ \"\$p\" != \"\$\$\" ]; then c=\$(cat /proc/\$p/cmdline 2>/dev/null); " +
-            "case \$c in *dnsmasq*) kill \$p 2>/dev/null; sleep 1 ;; esac; fi; "
-
-        // The /proc scan must skip its own shell: with "su -c <inline script>" the sh process
-        // cmdline contains the script text (including "hostapd"), so the scan would SIGTERM
-        // itself and fail with exit 143.
-        // The native hotspot profile is plain 11g: no A-MPDU frame aggregation and no WMM, so
-        // every frame pays full 11g airtime and video never gets EDCA priority. On this 2.4 GHz
-        // link that showed as 500 ms+ read stalls; with the HT profile, readMaxMs dropped to
-        // 145-200 ms and readsOver250Ms went to zero over dynamic scenes.
-        // hostapd reads /data/local/tmp/diplay_hostapd.conf, which DiPlay regenerates on every
-        // cold start: the miwifi daemon re-chowns /data/misc/wifi while a hotspot runs (even
-        // root gets EACCES there) and rewrites its own hostapd.conf back to the 11g template,
-        // so injecting into that file is unreliable. A private conf sidesteps both.
-        const val SU_HOTSPOT_UP_PREFIX = SU_KILL_DNSMASQ +
-            "k=0; for p in /proc/[0-9]*; do [ \${p#/proc/} -eq \$\$ ] && continue; " +
-            "c=\$(cat \$p/cmdline 2>/dev/null); case \$c in *hostapd*) kill \${p#/proc/} 2>/dev/null; k=1 ;; esac; done; " +
-            "[ \$k -gt 0 ] && sleep 1; setprop ctl.stop mdnsd; ifconfig wlan0 down; "
-
-        // hostapd drops privileges to AID_WIFI after starting, so a root-owned 600 conf
-        // is unreadable ("Could not open configuration file" in logcat) and the AP never
-        // comes up. The conf holds only the WPA2 passphrase, which the head unit needs
-        // anyway to run the AP; 644 keeps it world-readable like /data/misc/wifi files.
-        const val SU_HOTSPOT_UP_TAIL =
-            "chmod 644 /data/local/tmp/diplay_hostapd.conf; " +
-            "/system/bin/hostapd -B /data/local/tmp/diplay_hostapd.conf; sleep 1; " +
-            "ifconfig wlan0 192.168.43.1 netmask 255.255.255.0 up; " +
-            "dnsmasq --interface=wlan0 --bind-interfaces --dhcp-range=192.168.43.10,192.168.43.100,12h " +
-            "--dhcp-option=3,192.168.43.1 --dhcp-option=6,8.8.8.8 --no-resolv --pid-file=/data/local/tmp/dnsmasq.pid"
-
-        // Also drop the static address: `ifconfig down` alone keeps it in the kernel, which
-        // would make the next start's fast path see a "hotspot" without any services.
-        const val SU_HOTSPOT_DOWN = SU_KILL_DNSMASQ +
-            "for p in /proc/[0-9]*; do [ \${p#/proc/} -eq \$\$ ] && continue; c=\$(cat \$p/cmdline 2>/dev/null); case \$c in *hostapd*) kill \${p#/proc/} 2>/dev/null ;; esac; done; " +
-            "ifconfig wlan0 0.0.0.0"
+        // Opaque opcodes the assistant app's CpManager maps back to the real hotspot scripts.
+        // This APK keeps only these tokens; the actual hostapd/dnsmasq/rmem/wifi-restore shell
+        // text lives in the assistant process to keep decompilation from revealing the wiring.
+        const val OP_HOTSPOT_PREP = "n0"
+        const val OP_HOTSPOT_UP = "n1"
+        const val OP_HOTSPOT_DOWN = "n2"
+        const val OP_RMEM = "n3"
+        const val OP_WIFI_RESTORE = "n4"
     }
 }

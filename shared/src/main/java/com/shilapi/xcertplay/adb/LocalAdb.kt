@@ -153,6 +153,33 @@ class LocalAdb(context: Context) : Closeable {
     }
 
     /**
+     * One-shot opcode command. The assistant app's CpManager translates [op] (an opaque token
+     * such as `n0`/`n1`) plus optional newline-joined [args] into the real privileged command it
+     * owns; this app never holds the underlying shell text, so decompiling it does not reveal the
+     * hotspot wiring. Answer semantics match [exec].
+     */
+    @Synchronized
+    fun execOp(op: String, args: String?, timeoutMillis: Int): RootResult? {
+        if (cancelled.get() || closed.get()) return null
+        val bounded = timeoutMillis.coerceIn(1, MAX_COMMAND_TIMEOUT_MS)
+        val requestId = requestIds.incrementAndGet()
+        val result = Pending()
+        pending[requestId] = result
+        broadcast(ACTION_CP_OP) { intent ->
+            intent.putExtra(EXTRA_REQUEST_ID, requestId)
+            intent.putExtra(EXTRA_OP, op)
+            if (args != null) intent.putExtra(EXTRA_ARGS, args)
+            intent.putExtra(EXTRA_TIMEOUT_MS, bounded.toLong())
+        }
+        if (!awaitPending(result, requestId, bounded + RESULT_GRACE_MILLIS)) return null
+        return if (result.error != null) {
+            RootResult(result.exit, result.error)
+        } else {
+            RootResult(result.exit, result.output)
+        }
+    }
+
+    /**
      * 请求小助手把车机媒体源切换到 [sourceId]（43=APPS，44=CarPlay）。仅投递不等待应答：
      * 小助手 CpManager 收到后转发 MG_CHANGE_SOURCE_MANUAL 完成切换，其 RESULT 回执因无
      * 对应 Pending 而被忽略。调用方通常用短期实例（`use`）发出即可。
@@ -406,6 +433,7 @@ class LocalAdb(context: Context) : Closeable {
         const val ACTION_CP_SESSION_WRITE = "com.automanager.cp.SESSION_WRITE"
         const val ACTION_CP_SESSION_CLOSE = "com.automanager.cp.SESSION_CLOSE"
         const val ACTION_CP_SWITCH_SOURCE = "com.automanager.cp.SWITCH_SOURCE"
+        const val ACTION_CP_OP = "com.automanager.cp.OP"
         const val ACTION_CP_RESULT = "com.automanager.cp.RESULT"
         const val ACTION_CP_SESSION_ACK = "com.automanager.cp.SESSION_ACK"
         const val ACTION_CP_SESSION_OUT = "com.automanager.cp.SESSION_OUT"
@@ -424,6 +452,8 @@ class LocalAdb(context: Context) : Closeable {
         const val EXTRA_LINE = "line"
         const val EXTRA_OK = "ok"
         const val EXTRA_CLOSED = "closed"
+        const val EXTRA_OP = "op"
+        const val EXTRA_ARGS = "args"
 
         const val CAP_ROOT = "root"
 
