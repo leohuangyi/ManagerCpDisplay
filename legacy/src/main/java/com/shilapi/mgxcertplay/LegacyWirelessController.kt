@@ -559,6 +559,79 @@ class LegacyWirelessController(
         }
     }
 
+    /** Connects [phone] to one Bluetooth profile via the public (@hide) connect method. */
+    private fun connectProfile(phone: BluetoothDevice, profile: Int, label: String) {
+        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return
+        val latch = CountDownLatch(1)
+        var proxy: BluetoothProfile? = null
+        val listener = object : BluetoothProfile.ServiceListener {
+            override fun onServiceConnected(connectedProfile: Int, connectedProxy: BluetoothProfile) {
+                proxy = connectedProxy
+                latch.countDown()
+            }
+
+            override fun onServiceDisconnected(disconnectedProfile: Int) {
+                latch.countDown()
+            }
+        }
+        try {
+            if (!adapter.getProfileProxy(context, listener, profile)) {
+                log("$label proxy request rejected; skipping connect")
+                return
+            }
+            if (!latch.await(3, TimeUnit.SECONDS) || proxy == null) {
+                log("$label proxy unavailable; skipping connect")
+                return
+            }
+            if (proxy!!.connectedDevices.contains(phone)) {
+                log("$label already connected to iPhone; nothing to connect")
+                return
+            }
+            val method = when (proxy) {
+                is BluetoothA2dp ->
+                    BluetoothA2dp::class.java.getMethod("connect", BluetoothDevice::class.java)
+                is BluetoothHeadset ->
+                    BluetoothHeadset::class.java.getMethod("connect", BluetoothDevice::class.java)
+                else -> null
+            }
+            if (method == null) {
+                log("$label lacks a reflective connect; skipping")
+                return
+            }
+            method.invoke(proxy, phone)
+            log("$label connect requested")
+        } catch (error: Throwable) {
+            log("$label connect failed: ${error.javaClass.simpleName}: ${error.message}")
+        } finally {
+            proxy?.let { runCatching { adapter.closeProfileProxy(profile, it) } }
+        }
+    }
+
+    /**
+     * Re-links A2DP and HFP after the Bluetooth bootstrap succeeded. [disconnectHfp] tore both
+     * down before the handshake to clear the stale RFCOMM/L2CAP channels. This head unit keeps
+     * media on the native BlueZ A2DP service and calls on the native BlueZ HFP service (the iPhone
+     * does not route them through CarPlay), so both must be reconnected or media/calls stay silent.
+     * Runs on its own thread with a short settle window so it never blocks the RFCOMM thread.
+     */
+    private fun reconnectBluetoothProfiles(phone: BluetoothDevice) {
+        Thread({
+            try {
+                Thread.sleep(BLUETOOTH_PROFILE_SETTLE_MS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return@Thread
+            }
+            if (!closed.get()) {
+                connectProfile(phone, BluetoothProfile.A2DP, "A2DP")
+                connectProfile(phone, BluetoothProfile.HEADSET, "HFP")
+            }
+        }, "legacy-profile-reconnect").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
     private fun runAirPlayServer(
         server: ServerSocket,
         config: AirPlayConfig,
@@ -672,7 +745,10 @@ class LegacyWirelessController(
             Iap2WirelessControlClient(session, mfiClient).run(
                 identification = identification,
                 endpoint = endpoint,
-                onReady = { log("Bluetooth bootstrap ready; handing off to Wi-Fi") },
+                onReady = {
+                    log("Bluetooth bootstrap ready; handing off to Wi-Fi")
+                    reconnectBluetoothProfiles(phone)
+                },
                 onProgress = { log("Bluetooth: $it") },
             )
         } catch (e: Throwable) {
