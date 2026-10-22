@@ -14,8 +14,8 @@ android {
         applicationId = "com.shilapi.mgxcertplay"
         minSdk = 17
         targetSdk = 18
-        versionCode = 105
-        versionName = "1.0.5"
+        versionCode = 106
+        versionName = "1.0.6"
 
         multiDexEnabled = true
 

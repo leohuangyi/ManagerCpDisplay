@@ -3,6 +3,7 @@ package com.shilapi.mgxcertplay
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
@@ -12,6 +13,8 @@ import android.view.MotionEvent
 import android.view.Surface
 import com.shilapi.xcertplay.media.AndroidMediaSink
 import com.shilapi.xcertplay.media.CarPlayTouchMapper
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * Locale-independent status codes the host reports while booting the wireless link. The
@@ -270,7 +273,7 @@ object LegacyWirelessHost {
         // No paired iPhone: do not give up on the start. The pairing happens in the head
         // unit's Bluetooth settings, outside the app, so keep polling until a device shows
         // up and then boot the session. The activity shows its pairing hint meanwhile.
-        var phone = findPhone()
+        var phone = findPhone(appContext)
         if (phone == null) {
             log("no paired iPhone found; pair an iPhone over Bluetooth first")
             onStatus(StatusUpdate(HostStatus.NO_PAIRED))
@@ -278,7 +281,7 @@ object LegacyWirelessHost {
         while (phone == null) {
             Thread.sleep(3000L)
             if (controller !== next) return // shut down while waiting for a pairing
-            phone = findPhone()
+            phone = findPhone(appContext)
             if (phone != null) log("paired iPhone found: ${phone.name ?: phone.address}")
         }
         log("starting wireless CarPlay with ${phone.name ?: phone.address}")
@@ -525,7 +528,7 @@ object LegacyWirelessHost {
         }
     }
 
-    private fun findPhone(): BluetoothDevice? {
+    private fun findPhone(context: Context): BluetoothDevice? {
         val adapter = BluetoothAdapter.getDefaultAdapter()
         if (adapter == null) {
             Log.w(TAG, "findPhone: BluetoothAdapter.getDefaultAdapter() returned null")
@@ -534,6 +537,18 @@ object LegacyWirelessHost {
         if (!adapter.isEnabled) {
             Log.w(TAG, "findPhone: adapter off (state=${adapter.state})")
             return null
+        }
+        // 已连接的设备优先：CarPlay 刚打开时，正在通电话/放音乐的 iPhone 已经是 A2DP/HFP 连接态，
+        // 应直接用它来链接，而不是不管连接状态就抓第一个已配对设备。
+        val connected = listOf(2, 101, 1)
+            .flatMap { connectedDevices(context, adapter, it) }
+            .distinctBy { it.address }
+        if (connected.isNotEmpty()) {
+            val chosen = connected.first()
+            Log.i(TAG, "findPhone: ${connected.size} connected -> " +
+                connected.joinToString { "${it.name ?: "<unnamed>"} (${it.address})" } +
+                " ; picked ${chosen.name ?: "<unnamed>"} (${chosen.address})")
+            return chosen
         }
         val bonded = runCatching { adapter.bondedDevices }
             .onFailure { error -> Log.w(TAG, "findPhone: getBondedDevices threw", error) }
@@ -551,6 +566,32 @@ object LegacyWirelessHost {
             bonded.joinToString { "${it.name ?: "<unnamed>"} (${it.address})" } +
             " ; picked ${chosen?.name ?: "<unnamed>"} (${chosen?.address})")
         return chosen
+    }
+
+    /** Queries the currently connected devices of one Bluetooth profile via its proxy. */
+    private fun connectedDevices(context: Context, adapter: BluetoothAdapter, profile: Int): List<BluetoothDevice> {
+        val latch = CountDownLatch(1)
+        var proxy: BluetoothProfile? = null
+        val listener = object : BluetoothProfile.ServiceListener {
+            override fun onServiceConnected(connectedProfile: Int, connectedProxy: BluetoothProfile) {
+                proxy = connectedProxy
+                latch.countDown()
+            }
+
+            override fun onServiceDisconnected(disconnectedProfile: Int) {
+                latch.countDown()
+            }
+        }
+        try {
+            if (!adapter.getProfileProxy(context, listener, profile)) return emptyList()
+            if (!latch.await(2, TimeUnit.SECONDS)) return emptyList()
+            return proxy?.connectedDevices ?: emptyList()
+        } catch (error: Throwable) {
+            Log.w(TAG, "connectedDevices(profile=$profile) failed", error)
+            return emptyList()
+        } finally {
+            proxy?.let { runCatching { adapter.closeProfileProxy(profile, it) } }
+        }
     }
 
     private fun align(value: Int): Int = (value / 2 * 2).coerceAtLeast(2)

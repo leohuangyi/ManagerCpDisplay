@@ -1,9 +1,7 @@
 package com.shilapi.mgxcertplay
 
-import android.bluetooth.BluetoothA2dp
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothHeadset
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothSocket
 import android.content.Context
@@ -86,6 +84,24 @@ class LegacyWirelessController(
         private const val RFCOMM_SDP_RETRY_DELAY_MS = 4000L
         // Settle time after disconnecting HFP/A2DP before opening the CarPlay RFCOMM channel.
         private const val BLUETOOTH_PROFILE_SETTLE_MS = 2500L
+        // OEM profile ids. HFP is NOT the standard BluetoothProfile.HEADSET (1); this head unit
+        // runs HFP as BluetoothHeadsetHf (profile 101) inside system_server, so profile 1 can
+        // never reach the service that actually owns the RFCOMM channel. A2DP (2) is standard.
+        private const val PROFILE_HFP = 101
+        private const val PROFILE_A2DP = 2
+        // Rapid re-opens can leave the previous profile's RFCOMM/L2CAP channel half-torn-down, so a
+        // single connect() can land in STATE_CONNECTING and fall back instead of reaching connected.
+        // Retry each profile a few times and poll for the connected state before giving up.
+        private const val PROFILE_CONNECT_RETRIES = 3
+        private const val PROFILE_CONNECT_ATTEMPT_TIMEOUT_MS = 4_000L
+        private const val PROFILE_CONNECT_POLL_MS = 250L
+        // CarPlay hands audio off by sending "disableBluetooth" right after the AirPlay session
+        // goes active. Only HFP is re-linked here: A2DP is left to the system because its profile 2
+        // proxy misreports connectedDevices (it said "not connected" while BluetoothA2dpService was
+        // still streaming), so a disconnect would be a no-op and the follow-up connect doomed. The
+        // switch has no completion ack, so a fixed settle window is used; if the connect still fails,
+        // the system's own background connectSource re-links it later (~30s) as a fallback.
+        private const val MEDIA_SOURCE_SWITCH_SETTLE_MS = 10_000L
         /** AirPlay resource id and changeModes transfer types for the CarPlay main screen. */
         private const val RESOURCE_ID_MAIN_SCREEN = 1
         private const val TRANSFER_BORROW = 3
@@ -107,6 +123,8 @@ class LegacyWirelessController(
     @Volatile private var rfcommSession: Iap2Session? = null
     /** The iPhone this controller bootstrapped against, used to tear down Bluetooth profiles on exit. */
     @Volatile private var phone: BluetoothDevice? = null
+    /** Guards reconnectBluetoothProfiles so it only re-links the profiles once per session. */
+    private val bluetoothProfilesReconnected = AtomicBoolean(false)
     private val resources = CopyOnWriteArrayList<Closeable>()
     @Volatile private var bootstrapThread: Thread? = null
     private val trackThreads = CopyOnWriteArrayList<Thread>()
@@ -125,6 +143,8 @@ class LegacyWirelessController(
             log("AirPlay session active; waiting for video")
             // CarPlay 控制会话建立后，请求小助手切到蓝牙媒体源(19)，让音频从蓝牙侧出来。每次新会话重新请求一次。
             LocalAdb(context).use { it.requestSourceSwitch() }
+            // 媒体源切换完成后「先断开→再连接」HFP（A2DP 交给系统自管，不主动断开/重连）。
+            scheduleBluetoothProfileReconnectAfterMediaSourceSwitch()
         }
 
         override fun onSessionEnded(session: AirPlaySession) {
@@ -148,6 +168,12 @@ class LegacyWirelessController(
         }
 
         override fun onCommand(session: AirPlaySession, type: String, params: Map<String, Any?>) {
+            // The iPhone sends "disableBluetooth" when it takes over audio from the CarPlay
+            // handshake. The HFP re-link now runs after the media source switch instead, so
+            // here we only record the handoff for diagnostics.
+            if (type.equals("disableBluetooth", ignoreCase = true) || type.equals("disable-bluetooth", ignoreCase = true)) {
+                log("iPhone sent $type (audio handoff); HFP re-link runs after media source switch")
+            }
             // modesChanged (and the changeModes family) reports which side owns each resource:
             // entity 1 = iPhone, 2 = accessory. Tracked for the logs: a borrow shows up as
             // entity 2 and the unborrow returns it to 1.
@@ -276,17 +302,17 @@ class LegacyWirelessController(
 
         val btMac = adapter.address ?: throw IllegalStateException("unable to read Bluetooth address")
 
-        // A cold start used to run its three independent stages back to back: hotspot bring-up
-        // (the long pole), MFi/media session setup, and the HFP disconnect that frees the
-        // RFCOMM channel. They now run on three parallel tracks and meet at a latch; a failure
-        // on any track aborts the bootstrap without waiting for the others. The latch gives
-        // the join the visibility a plain volatile read could not guarantee on every JVM.
+        // A cold start used to run its stages back to back; now only the hotspot bring-up (the
+        // long pole) and MFi/media session setup run, in parallel and meeting at a latch. HFP is
+        // no longer disconnected up front: the RFCOMM bootstrap clears it only if its own connect
+        // hits EBUSY. A failure on any track aborts the bootstrap; the latch gives the join the
+        // visibility a plain volatile read could not guarantee on every JVM.
         val network = LegacyNetwork(context, networkMode, { closed.get() }, log)
             .also { this.network = it; resources += it }
         var endpoint: LegacyNetwork.Endpoint? = null
         var parts: SessionParts? = null
         val failures = CopyOnWriteArrayList<Throwable>()
-        val tracks = CountDownLatch(3)
+        val tracks = CountDownLatch(2)
 
         fun track(name: String, work: () -> Unit) {
             Thread({
@@ -306,7 +332,6 @@ class LegacyWirelessController(
 
         track("legacy-network-prep", { endpoint = network.prepare() })
         track("legacy-session-prep", { parts = prepareSession(btMac) })
-        track("legacy-hfp-disconnect", { disconnectHfp(phone) })
 
         while (true) {
             // Fail fast: keep waiting only while every track is still healthy.
@@ -492,23 +517,6 @@ class LegacyWirelessController(
         return SessionParts(config, identity, pairings, mfi, mfiClient, media, deviceId)
     }
 
-    /**
-     * Disconnects the OEM Hands-Free and A2DP profiles from the iPhone before opening the CarPlay
-     * RFCOMM channel. The wired CarPlay stack leaves both RFCOMM (HFP) and L2CAP (A2DP) links live
-     * after USB unplug, and BlueZ rejects a fresh RFCOMM connect with EBUSY until they settle. The
-     * public profile proxies may report no "connected" device while the underlying channel is still
-     * tearing down, so both profiles are disconnected and a fixed settle window is always waited.
-     */
-    private fun disconnectHfp(phone: BluetoothDevice) {
-        disconnectProfile(phone, BluetoothProfile.HEADSET, "HFP")
-        disconnectProfile(phone, BluetoothProfile.A2DP, "A2DP")
-        try {
-            Thread.sleep(BLUETOOTH_PROFILE_SETTLE_MS)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-        }
-    }
-
     /** Disconnects [phone] from one Bluetooth profile via the public (@hide) disconnect method. */
     private fun disconnectProfile(phone: BluetoothDevice, profile: Int, label: String) {
         val adapter = BluetoothAdapter.getDefaultAdapter() ?: return
@@ -533,21 +541,10 @@ class LegacyWirelessController(
                 log("$label proxy unavailable; skipping disconnect")
                 return
             }
-            val connected = proxy!!.connectedDevices
-            if (connected.contains(phone)) {
+            val p = proxy!!
+            if (p.connectedDevices.contains(phone)) {
                 log("Disconnecting $label from iPhone")
-                val method = when (proxy) {
-                    is BluetoothHeadset ->
-                        BluetoothHeadset::class.java.getMethod("disconnect", BluetoothDevice::class.java)
-                    is BluetoothA2dp ->
-                        BluetoothA2dp::class.java.getMethod("disconnect", BluetoothDevice::class.java)
-                    else -> null
-                }
-                if (method == null) {
-                    log("$label lacks a reflective disconnect; skipping")
-                    return
-                }
-                method.invoke(proxy, phone)
+                p.javaClass.getMethod("disconnect", BluetoothDevice::class.java).invoke(p, phone)
                 log("$label disconnect requested")
             } else {
                 log("$label not connected to iPhone; nothing to disconnect")
@@ -559,7 +556,7 @@ class LegacyWirelessController(
         }
     }
 
-    /** Connects [phone] to one Bluetooth profile via the public (@hide) connect method. */
+    /** Connects [phone] to one Bluetooth profile via the OEM @hide connect path, retrying on failure. */
     private fun connectProfile(phone: BluetoothDevice, profile: Int, label: String) {
         val adapter = BluetoothAdapter.getDefaultAdapter() ?: return
         val latch = CountDownLatch(1)
@@ -583,23 +580,56 @@ class LegacyWirelessController(
                 log("$label proxy unavailable; skipping connect")
                 return
             }
-            if (proxy!!.connectedDevices.contains(phone)) {
+            val p = proxy!!
+            if (p.connectedDevices.contains(phone)) {
                 log("$label already connected to iPhone; nothing to connect")
                 return
             }
-            val method = when (proxy) {
-                is BluetoothA2dp ->
-                    BluetoothA2dp::class.java.getMethod("connect", BluetoothDevice::class.java)
-                is BluetoothHeadset ->
-                    BluetoothHeadset::class.java.getMethod("connect", BluetoothDevice::class.java)
-                else -> null
+            // OEM connectDeviceAllowRePairing (z2=true) semantics, mapped to the methods that
+            // actually exist on this ROM's @hide proxies (verified via runtime NoSuchMethodException):
+            // HFP (BluetoothHeadsetHf, profile 101) has NO connectAllowRePairing -- the allowRePairing
+            // variant is the two-arg connect(BluetoothDevice, boolean)=true; A2DP (profile 2) only has
+            // the plain connect(BluetoothDevice). Both are @hide, hence reflection.
+            repeat(PROFILE_CONNECT_RETRIES) { attempt ->
+                try {
+                    when (profile) {
+                        PROFILE_HFP -> p.javaClass.getMethod(
+                            "connect", BluetoothDevice::class.java, Boolean::class.javaPrimitiveType
+                        ).invoke(p, phone, true)
+
+                        PROFILE_A2DP -> p.javaClass.getMethod(
+                            "connect", BluetoothDevice::class.java
+                        ).invoke(p, phone)
+
+                        else -> {
+                            log("$label has no OEM connect method; skipping")
+                            return
+                        }
+                    }
+                    log("$label connect requested (attempt ${attempt + 1}/$PROFILE_CONNECT_RETRIES)")
+
+                    // Poll for the connected state instead of trusting the fire-and-forget connect():
+                    // the rapid-reopen path can drop a fresh connect from STATE_CONNECTING straight
+                    // back to disconnected, and only a re-issue once things settle recovers it.
+                    val deadline = System.currentTimeMillis() + PROFILE_CONNECT_ATTEMPT_TIMEOUT_MS
+                    while (System.currentTimeMillis() < deadline && !closed.get()) {
+                        if (p.connectedDevices.contains(phone)) {
+                            log("$label connected")
+                            return
+                        }
+                        try {
+                            Thread.sleep(PROFILE_CONNECT_POLL_MS)
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            return
+                        }
+                    }
+                    if (!closed.get()) log("$label not connected after attempt ${attempt + 1}")
+                } catch (error: Throwable) {
+                    log("$label connect failed (attempt ${attempt + 1}): ${error.javaClass.simpleName}: ${error.message}")
+                }
             }
-            if (method == null) {
-                log("$label lacks a reflective connect; skipping")
-                return
-            }
-            method.invoke(proxy, phone)
-            log("$label connect requested")
+            log("$label connect gave up after $PROFILE_CONNECT_RETRIES attempts")
         } catch (error: Throwable) {
             log("$label connect failed: ${error.javaClass.simpleName}: ${error.message}")
         } finally {
@@ -608,25 +638,55 @@ class LegacyWirelessController(
     }
 
     /**
-     * Re-links A2DP and HFP after the Bluetooth bootstrap succeeded. [disconnectHfp] tore both
-     * down before the handshake to clear the stale RFCOMM/L2CAP channels. This head unit keeps
-     * media on the native BlueZ A2DP service and calls on the native BlueZ HFP service (the iPhone
-     * does not route them through CarPlay), so both must be reconnected or media/calls stay silent.
-     * Runs on its own thread with a short settle window so it never blocks the RFCOMM thread.
+     * Re-links only HFP after the media source has switched to Bluetooth (19). A2DP is intentionally
+     * left untouched: on this head unit the profile 2 proxy misreports connectedDevices (it said
+     * "not connected" while BluetoothA2dpService was still streaming), so a disconnect would be a
+     * no-op and the follow-up connect doomed. Only the OEM HFP (profile 101) is re-linked here.
      */
-    private fun reconnectBluetoothProfiles(phone: BluetoothDevice) {
+    private fun reconnectBluetoothProfiles() {
+        val phone = this.phone ?: return
+        if (!bluetoothProfilesReconnected.compareAndSet(false, true)) {
+            log("Native Bluetooth profiles already queued; skipping re-link")
+            return
+        }
+        log("Queueing native HFP re-link (disconnect then reconnect)")
         Thread({
+            if (closed.get()) return@Thread
+            disconnectProfile(phone, PROFILE_HFP, "HFP")
             try {
                 Thread.sleep(BLUETOOTH_PROFILE_SETTLE_MS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
                 return@Thread
             }
-            if (!closed.get()) {
-                connectProfile(phone, BluetoothProfile.A2DP, "A2DP")
-                connectProfile(phone, BluetoothProfile.HEADSET, "HFP")
+            if (closed.get()) return@Thread
+            Thread({ if (!closed.get()) connectProfile(phone, PROFILE_HFP, "HFP") }, "legacy-profile-hfp").apply {
+                isDaemon = true
+                start()
             }
         }, "legacy-profile-reconnect").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    /**
+     * Re-links native HFP only after the media source has finished switching to the Bluetooth
+     * audio source (19). The switch has no completion ack (the assistant replies exit=0 as soon as
+     * it forwards MG_CHANGE_SOURCE_MANUAL), so a fixed settle window is used. If
+     * [reconnectBluetoothProfiles] already ran this becomes a no-op.
+     */
+    private fun scheduleBluetoothProfileReconnectAfterMediaSourceSwitch() {
+        Thread({
+            try {
+                Thread.sleep(MEDIA_SOURCE_SWITCH_SETTLE_MS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return@Thread
+            }
+            if (closed.get()) return@Thread
+            reconnectBluetoothProfiles()
+        }, "legacy-profile-reconnect-after-source").apply {
             isDaemon = true
             start()
         }
@@ -688,10 +748,12 @@ class LegacyWirelessController(
         // This head unit kills a backgrounded process within seconds; when CarPlay was running
         // the Bluetooth service still holds the phone's RFCOMM channel and a fresh connect
         // fails with "Device or resource busy". One socket per attempt plus a short wait lets
-        // that stale state clear (or an in-flight HFP disconnect finish) instead of failing
-        // the whole start. Only the connect stage retries: a dropped established session is a
-        // real failure, and the Wi-Fi tunnel keeps the session alive anyway.
+        // that stale state clear. HFP is not disconnected up front anymore: only if a connect
+        // fails with EBUSY do we clear the HFP RFCOMM once, then retry. Only the connect stage
+        // retries: a dropped established session is a real failure, and the Wi-Fi tunnel keeps
+        // the session alive anyway.
         var attempt = 0
+        var hfpClearedOnBusy = false
         var connected: BluetoothSocket? = null
         var stream: BluetoothRfcommDuplexStream? = null
         try {
@@ -716,10 +778,18 @@ class LegacyWirelessController(
                     // RFCOMM/L2CAP link is still clearing, SDP failure means the iPhone has not
                     // entered wireless iAP2 mode yet. Both deserve a longer wait than a generic
                     // connect error rather than a blind fixed retry.
+                    val busy = message.contains("busy", ignoreCase = true)
                     val delay = when {
-                        message.contains("busy", ignoreCase = true) -> RFCOMM_BUSY_RETRY_DELAY_MS
+                        busy -> RFCOMM_BUSY_RETRY_DELAY_MS
                         message.contains("Service discovery", ignoreCase = true) -> RFCOMM_SDP_RETRY_DELAY_MS
                         else -> RFCOMM_CONNECT_RETRY_DELAY_MS
+                    }
+                    // HFP is not disconnected up front; on the first EBUSY clear the OEM HFP
+                    // RFCOMM channel once and let the retry connect cleanly.
+                    if (busy && !hfpClearedOnBusy) {
+                        hfpClearedOnBusy = true
+                        log("Bluetooth RFCOMM busy; clearing HFP channel before retry")
+                        disconnectProfile(phone, PROFILE_HFP, "HFP")
                     }
                     if (!closed.get() && attempt < RFCOMM_CONNECT_ATTEMPTS) {
                         log("Bluetooth RFCOMM attempt $attempt failed ($message); retrying in ${delay}ms")
@@ -747,7 +817,6 @@ class LegacyWirelessController(
                 endpoint = endpoint,
                 onReady = {
                     log("Bluetooth bootstrap ready; handing off to Wi-Fi")
-                    reconnectBluetoothProfiles(phone)
                 },
                 onProgress = { log("Bluetooth: $it") },
             )
@@ -905,8 +974,8 @@ class LegacyWirelessController(
         // the phone's Bluetooth state is clean rather than half-connected when the OEM stack
         // retries (a stale link is what surfaced as "bt_transport_open: INCORRECT STATE").
         phone?.let {
-            disconnectProfile(it, BluetoothProfile.HEADSET, "HFP")
-            disconnectProfile(it, BluetoothProfile.A2DP, "A2DP")
+            disconnectProfile(it, PROFILE_HFP, "HFP")
+            disconnectProfile(it, PROFILE_A2DP, "A2DP")
         }
     }
 
