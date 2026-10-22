@@ -11,7 +11,6 @@ import java.io.File
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.NetworkInterface
-import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import com.shilapi.xcertplay.adb.LocalAdb
@@ -19,11 +18,9 @@ import com.shilapi.xcertplay.adb.LocalAdb
 /**
  * Brings up the wireless link for CarPlay:
  *
- *  - `direct`: Wi-Fi Direct Group Owner via [WifiP2pManager.createGroup] (needs P2P-capable firmware).
  *  - `auto`: start the hotspot natively over root (hostapd -> static IP -> dnsmasq), since the
  *    miwifi firmware's `setWifiApEnabled` never launches hostapd; reuses it when already up.
- *  - `app` / `saved`: the head unit becomes a WPA2 hotspot through the hidden
- *    `WifiManager.setWifiApEnabled` reflection API (broken on this firmware).
+ *  - `direct`: Wi-Fi Direct Group Owner via [WifiP2pManager.createGroup] (needs P2P-capable firmware).
  */
 class LegacyNetwork(
     private val context: Context,
@@ -53,8 +50,7 @@ class LegacyNetwork(
 
     fun prepare(): Endpoint = when (networkMode) {
         "direct" -> prepareDirect()
-        "auto" -> prepareAuto()
-        else -> prepareSoftAp()
+        else -> prepareAuto()
     }
 
     // --- Wi-Fi Direct (P2P) ---------------------------------------------------------------
@@ -245,79 +241,6 @@ class LegacyNetwork(
         else result.exit to result.output.orEmpty()
     }
 
-    // --- Hotspot via setWifiApEnabled reflection (app / saved) -----------------------------
-
-    private fun prepareSoftAp(): Endpoint {
-        oldApConfig = currentApConfig()
-        apWasEnabled = runCatching { state() == AP_STATE_ENABLED }.getOrDefault(false)
-        stationWasEnabled = wifi.isWifiEnabled
-
-        var config = oldApConfig ?: WifiConfiguration()
-        if (networkMode == "app") {
-            val prefs = context.getSharedPreferences("receiver-network", Context.MODE_PRIVATE)
-            var password = prefs.getString("password", null)
-            if (password == null) {
-                password = UUID.randomUUID().toString().replace("-", "").take(16)
-                prefs.edit().putString("password", password).commit()
-            }
-            config = WifiConfiguration().apply {
-                SSID = "DiPlay-Legacy"
-                preSharedKey = password
-                allowedKeyManagement.set(WifiConfiguration.KeyMgmt.WPA_PSK)
-            }
-        }
-
-        val ssid = config.SSID
-        val key = config.preSharedKey
-        check(!ssid.isNullOrBlank() && !key.isNullOrEmpty() &&
-            config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.WPA_PSK)) {
-            "Configure a WPA2 hotspot first"
-        }
-
-        if (!apWasEnabled || networkMode == "app") {
-            changedAp = true
-            try {
-                if (apWasEnabled) {
-                    check(setAp(oldApConfig, enabled = false)) { "could not stop the existing hotspot" }
-                }
-                if (stationWasEnabled) {
-                    check(wifi.setWifiEnabled(false)) { "could not disable Wi-Fi station" }
-                }
-                check(!stopped() && setAp(config, enabled = true)) {
-                    "Hotspot rejected by firmware"
-                }
-                waitForApState()
-            } catch (e: Throwable) {
-                // A rejected hotspot must not leave the head unit with Wi-Fi off. Restore the station
-                // so the device stays reachable on the local network.
-                runCatching { setAp(null, enabled = false) }
-                if (stationWasEnabled) runCatching { wifi.setWifiEnabled(true) }
-                throw e
-            }
-        }
-
-        val channel = runCatching {
-            config.javaClass.getField("apChannel").getInt(config).coerceIn(0, 255)
-        }.getOrDefault(0)
-        val endpointSsid = unquote(ssid)
-        val endpointPassword = unquote(key)
-        val (iface, address) = findEndpoint(listOf("wlan", "ap"))
-            ?: throw IllegalStateException("Network IPv4 address unavailable")
-        log("Network mode=$networkMode interface=${iface.name} ready=true")
-        return Endpoint(endpointSsid, endpointPassword, channel, iface, address)
-    }
-
-    private fun waitForApState() {
-        val deadline = System.nanoTime() + 10_000_000_000L
-        while (!stopped() && System.nanoTime() < deadline) {
-            if (runCatching { state() == AP_STATE_ENABLED }.getOrDefault(false)) return
-            Thread.sleep(250)
-        }
-        check(!stopped() && runCatching { state() == AP_STATE_ENABLED }.getOrDefault(false)) {
-            "Hotspot startup timed out"
-        }
-    }
-
     // --- Shared helpers --------------------------------------------------------------------
 
     private fun findEndpoint(prefixes: List<String>): Pair<NetworkInterface, Inet4Address>? {
@@ -385,8 +308,6 @@ class LegacyNetwork(
         wifi.javaClass
             .getMethod("setWifiApEnabled", WifiConfiguration::class.java, java.lang.Boolean.TYPE)
             .invoke(wifi, config, enabled) == true
-
-    private fun unquote(value: String): String = value.removeSurrounding("\"")
 
     override fun close() {
         if (hotspotStartedByUs) {
