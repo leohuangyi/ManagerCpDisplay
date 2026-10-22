@@ -146,6 +146,12 @@ class LegacyNetwork(
             return Endpoint(ssid, password, channel, existing.first, existing.second)
         }
 
+        // 原车 MCS 自带无线 CarPlay 的蓝牙 iAP2（jiap_version_finalize tr_type=2 / mc_iap2_attach）
+        // 会抢占 iPhone 会话：DiPlay 的 0x4301 发出去后 iPhone 仍绑在原车 MCS，不会加入
+        // DiPlay-Legacy 热点。拉起热点前先 mcreset（kill mcservice）把蓝牙 iAP2 让给 DiPlay。
+        val (mcRc, mcOut) = runOp(OP_MC_RESET, timeoutSeconds = 15)
+        log("McReset before hotspot rc=$mcRc out=${mcOut.trim().take(200)}")
+
         // Heavy path: one su call covers the root check, the firmware's hotspot profile and
         // the rmem_max raise. Three separate su spawns cost about a second each on this unit.
         val (prepRc, prepOut) = runOp(OP_HOTSPOT_PREP, timeoutSeconds = 8)
