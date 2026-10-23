@@ -213,18 +213,6 @@ class LegacySettingsActivity : Activity() {
             }
         }
 
-        card { c ->
-            val modes = LegacySettings.networkModes
-            val modeLabels = resources.getStringArray(R.array.network_mode_labels)
-            val currentMode = LegacySettings.networkMode(this)
-            val currentIndex = modes.indexOf(currentMode).coerceAtLeast(0)
-            choiceRow(c, getString(R.string.setting_network_mode), modeLabels[currentIndex],
-                getString(R.string.setting_takes_effect), modeLabels.toList()) { index ->
-                LegacySettings.setNetworkMode(this, modes[index])
-                render()
-            }
-        }
-
         caption(getString(R.string.caption_devices))
         card { c ->
             val devices = LegacySettings.pairedDevices(this)

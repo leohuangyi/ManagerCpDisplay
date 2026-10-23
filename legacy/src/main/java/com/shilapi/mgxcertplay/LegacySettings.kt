@@ -7,7 +7,6 @@ import android.content.Context
  * reference project's settings (the DiPlayActivity groups), trimmed to what the legacy
  * stack can actually obey:
  *
- *  - [LegacyWirelessHost] takes the network mode,
  *  - [LegacyWirelessController.prepareSession] takes fps, right-hand drive and HEVC,
  *  - [LegacyCarPlayActivity] takes auto-connect.
  */
@@ -18,29 +17,16 @@ object LegacySettings {
     private const val PAIRINGS_PREFS = "receiver-pairings"
 
     private const val KEY_AUTO_CONNECT = "auto_connect"
-    private const val KEY_NETWORK_MODE = "network_mode"
     private const val KEY_FPS = "fps"
     private const val KEY_RIGHT_HAND_DRIVE = "right_hand_drive"
     private const val KEY_HEVC = "hevc"
     private const val KEY_LAST_DEVICE = "last_device"
-
-    /** The network modes [LegacyNetwork] understands; "app"/"saved" are broken on this firmware. */
-    val networkModes: List<String> = listOf("auto", "direct")
 
     fun autoConnect(context: Context): Boolean =
         prefs(context).getBoolean(KEY_AUTO_CONNECT, true)
 
     fun setAutoConnect(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_AUTO_CONNECT, enabled).commit()
-    }
-
-    fun networkMode(context: Context): String {
-        val stored = prefs(context).getString(KEY_NETWORK_MODE, "auto") ?: "auto"
-        return if (stored in networkModes) stored else "auto"
-    }
-
-    fun setNetworkMode(context: Context, mode: String) {
-        prefs(context).edit().putString(KEY_NETWORK_MODE, mode).commit()
     }
 
     fun fps(context: Context): Int {

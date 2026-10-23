@@ -242,7 +242,7 @@ object LegacyWirelessHost {
                     mainHandler.post { restartWireless() }
                 }
             },
-            networkMode = LegacySettings.networkMode(appContext),
+            networkMode = "auto",
         )
         built = next
         controller = next

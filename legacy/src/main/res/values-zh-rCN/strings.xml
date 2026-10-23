@@ -44,9 +44,6 @@
     <string name="caption_connection">连接</string>
     <string name="setting_autoconnect">打开即连接</string>
     <string name="setting_autoconnect_summary">打开 CarPlay 应用后自动连接 iPhone</string>
-    <string name="setting_network_mode">网络模式</string>
-    <string name="network_mode_auto">自动热点（推荐）</string>
-    <string name="network_mode_direct">Wi-Fi 直连</string>
     <string name="setting_takes_effect">更改将在下次连接时生效</string>
     <string name="caption_devices">设备管理</string>
     <string name="no_paired_devices">暂无已配对设备</string>

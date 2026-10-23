@@ -44,9 +44,6 @@
     <string name="caption_connection">Connection</string>
     <string name="setting_autoconnect">Connect on launch</string>
     <string name="setting_autoconnect_summary">Connect to your iPhone automatically when the CarPlay app opens</string>
-    <string name="setting_network_mode">Network mode</string>
-    <string name="network_mode_auto">Auto hotspot (recommended)</string>
-    <string name="network_mode_direct">Wi-Fi Direct</string>
     <string name="setting_takes_effect">Takes effect on the next connection</string>
     <string name="caption_devices">Devices</string>
     <string name="no_paired_devices">No paired devices yet</string>
@@ -65,11 +62,6 @@
     <string name="action_save">Save</string>
     <string name="action_cancel">Cancel</string>
 
-    <!-- Ordered exactly like LegacySettings.networkModes (auto, direct) -->
-    <string-array name="network_mode_labels">
-        <item>@string/network_mode_auto</item>
-        <item>@string/network_mode_direct</item>
-    </string-array>
     <!-- Index 0 = 30 FPS, 1 = 60 FPS, matching LegacySettingsActivity. -->
     <string-array name="fps_labels">
         <item>@string/fps_30</item>
