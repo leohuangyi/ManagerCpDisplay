@@ -211,6 +211,8 @@ object LegacyWirelessHost {
             if (active && !videoReported) {
                 videoReported = true
                 onVideo()
+                // CarPlay 画面出现：引导已完全切换到 Wi-Fi，此时补连 A2DP 不会再撞 RFCOMM/iAP2。
+                controller?.ensureA2dpConnected()
             }
         }
         sink = nextSink
@@ -284,6 +286,8 @@ object LegacyWirelessHost {
             phone = findPhone(appContext)
             if (phone != null) log("paired iPhone found: ${phone.name ?: phone.address}")
         }
+        // Persist this iPhone as the last CarPlay device for the next cold start's tier-2 pick.
+        LegacySettings.setLastDeviceAddress(appContext, phone.address)
         log("starting wireless CarPlay with ${phone.name ?: phone.address}")
         next.start(phone)
     }
@@ -540,7 +544,7 @@ object LegacyWirelessHost {
         }
         // 已连接的设备优先：CarPlay 刚打开时，正在通电话/放音乐的 iPhone 已经是 A2DP/HFP 连接态，
         // 应直接用它来链接，而不是不管连接状态就抓第一个已配对设备。
-        val connected = listOf(2, 101, 1)
+        val connected = listOf(101, 2)
             .flatMap { connectedDevices(context, adapter, it) }
             .distinctBy { it.address }
         if (connected.isNotEmpty()) {
@@ -561,10 +565,20 @@ object LegacyWirelessHost {
             Log.i(TAG, "findPhone: bondedDevices empty (state=${adapter.state})")
             return null
         }
-        val chosen = bonded.firstOrNull()
+        // 次优：上一次链接过 CarPlay 的已配对设备（若仍配对）。
+        val lastAddress = LegacySettings.lastDeviceAddress(context)
+        if (lastAddress != null) {
+            val last = bonded.firstOrNull { it.address == lastAddress }
+            if (last != null) {
+                Log.i(TAG, "findPhone: using last CarPlay device ${last.name ?: "<unnamed>"} (${last.address})")
+                return last
+            }
+        }
+        // 兜底：已配对的第一个设备。
+        val chosen = bonded.first()
         Log.i(TAG, "findPhone: ${bonded.size} bonded -> " +
             bonded.joinToString { "${it.name ?: "<unnamed>"} (${it.address})" } +
-            " ; picked ${chosen?.name ?: "<unnamed>"} (${chosen?.address})")
+            " ; picked ${chosen.name ?: "<unnamed>"} (${chosen.address})")
         return chosen
     }
 

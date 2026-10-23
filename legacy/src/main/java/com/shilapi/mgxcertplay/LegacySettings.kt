@@ -22,6 +22,7 @@ object LegacySettings {
     private const val KEY_FPS = "fps"
     private const val KEY_RIGHT_HAND_DRIVE = "right_hand_drive"
     private const val KEY_HEVC = "hevc"
+    private const val KEY_LAST_DEVICE = "last_device"
 
     /** The network modes [LegacyNetwork] understands; "app"/"saved" are broken on this firmware. */
     val networkModes: List<String> = listOf("auto", "direct")
@@ -63,6 +64,15 @@ object LegacySettings {
 
     fun setHevc(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_HEVC, enabled).commit()
+    }
+
+    /** The Bluetooth address of the iPhone that last ran a CarPlay session, used as the tier-2
+     *  fallback device on the next cold start. Null until the first session is booted. */
+    fun lastDeviceAddress(context: Context): String? =
+        prefs(context).getString(KEY_LAST_DEVICE, null)
+
+    fun setLastDeviceAddress(context: Context, address: String) {
+        prefs(context).edit().putString(KEY_LAST_DEVICE, address).commit()
     }
 
     /** One paired iPhone. The prefs key is the identifier the iPhone sent during pairing;

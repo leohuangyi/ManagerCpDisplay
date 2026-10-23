@@ -89,6 +89,8 @@ class LegacyWirelessController(
         // never reach the service that actually owns the RFCOMM channel. A2DP (2) is standard.
         private const val PROFILE_HFP = 101
         private const val PROFILE_A2DP = 2
+        // BluetoothA2dp.PRIORITY_AUTO_CONNECT (hidden): set so the native stack also auto-reconnects.
+        private const val A2DP_PRIORITY_AUTO_CONNECT = 1000
         // Rapid re-opens can leave the previous profile's RFCOMM/L2CAP channel half-torn-down, so a
         // single connect() can land in STATE_CONNECTING and fall back instead of reaching connected.
         // Retry each profile a few times and poll for the connected state before giving up.
@@ -556,9 +558,10 @@ class LegacyWirelessController(
         }
     }
 
-    /** Connects [phone] to one Bluetooth profile via the OEM @hide connect path, retrying on failure. */
-    private fun connectProfile(phone: BluetoothDevice, profile: Int, label: String) {
-        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return
+    /** Connects [phone] to one Bluetooth profile via the OEM @hide connect path, retrying on failure.
+     *  Returns true once the profile reached the connected state, false when it gave up. */
+    private fun connectProfile(phone: BluetoothDevice, profile: Int, label: String): Boolean {
+        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return false
         val latch = CountDownLatch(1)
         var proxy: BluetoothProfile? = null
         val listener = object : BluetoothProfile.ServiceListener {
@@ -574,16 +577,16 @@ class LegacyWirelessController(
         try {
             if (!adapter.getProfileProxy(context, listener, profile)) {
                 log("$label proxy request rejected; skipping connect")
-                return
+                return false
             }
             if (!latch.await(3, TimeUnit.SECONDS) || proxy == null) {
                 log("$label proxy unavailable; skipping connect")
-                return
+                return false
             }
             val p = proxy!!
             if (p.connectedDevices.contains(phone)) {
                 log("$label already connected to iPhone; nothing to connect")
-                return
+                return true
             }
             // OEM connectDeviceAllowRePairing (z2=true) semantics, mapped to the methods that
             // actually exist on this ROM's @hide proxies (verified via runtime NoSuchMethodException):
@@ -597,13 +600,25 @@ class LegacyWirelessController(
                             "connect", BluetoothDevice::class.java, Boolean::class.javaPrimitiveType
                         ).invoke(p, phone, true)
 
-                        PROFILE_A2DP -> p.javaClass.getMethod(
-                            "connect", BluetoothDevice::class.java
-                        ).invoke(p, phone)
+                        PROFILE_A2DP -> {
+                            // 原厂 Settings 连接前把优先级设为 AUTO_CONNECT，让蓝牙栈后台也能自动重连。
+                            runCatching {
+                                p.javaClass.getMethod(
+                                    "setPriority", BluetoothDevice::class.java, Int::class.javaPrimitiveType
+                                ).invoke(p, phone, A2DP_PRIORITY_AUTO_CONNECT)
+                            }.onSuccess {
+                                log("$label priority set to AUTO_CONNECT($A2DP_PRIORITY_AUTO_CONNECT)")
+                            }.onFailure { error ->
+                                log("$label setPriority failed: ${error.javaClass.simpleName}: ${error.message}")
+                            }
+                            p.javaClass.getMethod(
+                                "connect", BluetoothDevice::class.java
+                            ).invoke(p, phone)
+                        }
 
                         else -> {
                             log("$label has no OEM connect method; skipping")
-                            return
+                            return false
                         }
                     }
                     log("$label connect requested (attempt ${attempt + 1}/$PROFILE_CONNECT_RETRIES)")
@@ -615,13 +630,13 @@ class LegacyWirelessController(
                     while (System.currentTimeMillis() < deadline && !closed.get()) {
                         if (p.connectedDevices.contains(phone)) {
                             log("$label connected")
-                            return
+                            return true
                         }
                         try {
                             Thread.sleep(PROFILE_CONNECT_POLL_MS)
                         } catch (_: InterruptedException) {
                             Thread.currentThread().interrupt()
-                            return
+                            return false
                         }
                     }
                     if (!closed.get()) log("$label not connected after attempt ${attempt + 1}")
@@ -630,8 +645,10 @@ class LegacyWirelessController(
                 }
             }
             log("$label connect gave up after $PROFILE_CONNECT_RETRIES attempts")
+            return false
         } catch (error: Throwable) {
             log("$label connect failed: ${error.javaClass.simpleName}: ${error.message}")
+            return false
         } finally {
             proxy?.let { runCatching { adapter.closeProfileProxy(profile, it) } }
         }
@@ -687,6 +704,26 @@ class LegacyWirelessController(
             if (closed.get()) return@Thread
             reconnectBluetoothProfiles()
         }, "legacy-profile-reconnect-after-source").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    /**
+     * Connects A2DP if the CarPlay iPhone is not already on it. The host calls this once the
+     * CarPlay screen stream carries its first frame (画面出现), by which point the RFCOMM/iAP2
+     * bootstrap has fully handed off to Wi-Fi, so touching A2DP can no longer collide with it.
+     * [connectProfile] is idempotent: it logs "already connected" and returns without issuing a
+     * connect when A2DP is already up, so this is safe to call even if the system already
+     * re-linked A2DP in the background.
+     */
+    fun ensureA2dpConnected() {
+        val phone = this.phone ?: return
+        if (closed.get()) return
+        Thread({
+            if (closed.get()) return@Thread
+            connectProfile(phone, PROFILE_A2DP, "A2DP")
+        }, "legacy-a2dp-ensure").apply {
             isDaemon = true
             start()
         }
@@ -968,15 +1005,10 @@ class LegacyWirelessController(
         wifiLocks.clear()
         resources.forEach { runCatching { it.close() } }
         resources.clear()
-        // Tear down any Bluetooth profiles still pointing at the iPhone so the OEM wired
-        // CarPlay stack can re-claim the device immediately after exit. The RFCOMM channel is
-        // already closed above; this clears the HFP/A2DP links the bootstrap disconnected, so
-        // the phone's Bluetooth state is clean rather than half-connected when the OEM stack
-        // retries (a stale link is what surfaced as "bt_transport_open: INCORRECT STATE").
-        phone?.let {
-            disconnectProfile(it, PROFILE_HFP, "HFP")
-            disconnectProfile(it, PROFILE_A2DP, "A2DP")
-        }
+        // Leave A2DP/HFP alone on exit: disconnecting them here drops the iPhone from the OEM
+        // Bluetooth stack entirely, forcing the driver back into the native Bluetooth screen to
+        // re-link. The RFCOMM bootstrap channel is already closed above, and any stale HFP RFCOMM
+        // is cleared on-demand by the RFCOMM EBUSY retry on the next connect instead.
     }
 
     /**
