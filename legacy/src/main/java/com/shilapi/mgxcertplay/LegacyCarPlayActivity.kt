@@ -154,6 +154,9 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun onPause() {
+        // CarPlay leaves the foreground: let the head unit's header interrupts (such as the
+        // Bluetooth track title) show again now that they no longer overlap the video.
+        HeaderOverlayGuard.restoreInterrupt(this)
         // The surface is torn down right after this: release the CarPlay video streams the
         // same way a TEARDOWN does, so the iPhone stops pushing frames into a decoder whose
         // surface is about to disappear. The control session stays alive.
@@ -163,6 +166,9 @@ class LegacyCarPlayActivity : Activity(), SurfaceHolder.Callback {
 
     override fun onResume() {
         super.onResume()
+        // CarPlay owns the screen: suppress the head unit's header interrupts so a Bluetooth
+        // AVRCP track change (the "lyrics") cannot pop up over the CarPlay video.
+        HeaderOverlayGuard.banInterrupt(this)
         // Back from the background: rebind the live session to the surface so the iPhone's
         // re-established video stream renders again. A recreated surface attaches through
         // surfaceCreated (boundSurface is then already replaced); this covers a resume where
