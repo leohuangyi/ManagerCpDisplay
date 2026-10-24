@@ -95,7 +95,7 @@ object LegacyCarPlayHost {
             deviceName = "CarPlay",
             deviceId = id,
             btMac = id,
-            sourceVersion = "950.7.1",
+            sourceVersion = "320.17.3",
             main = AirPlayDisplayConfig(
                 widthPixels = videoWidth,
                 heightPixels = videoHeight,

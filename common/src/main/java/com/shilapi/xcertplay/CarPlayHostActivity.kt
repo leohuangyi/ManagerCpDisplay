@@ -4945,7 +4945,7 @@ class CarPlayHostActivity : ComponentActivity() {
             deviceName = "DiPlay",
             deviceId = DiPlayBootstrap.deviceId(airPlayIdentity),
             btMac = DiPlayBluetooth.localAddress(this) ?: DiPlayBootstrap.deviceId(airPlayIdentity),
-            sourceVersion = "950.7.1",
+            sourceVersion = "320.17.3",
             main = declared,
             cluster = clusterDisplayConfig(),
             rightHandDrive = rightHandDrive,

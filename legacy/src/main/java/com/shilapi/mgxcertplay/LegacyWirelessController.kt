@@ -71,7 +71,7 @@ class LegacyWirelessController(
     companion object {
         private const val TAG = "LegacyWireless"
         private const val RFCOMM_UUID = "00000000-deca-fade-deca-deafdecacafe"
-        private const val SOURCE_VERSION = "950.7.1"
+        private const val SOURCE_VERSION = "320.17.3"
         // The stale RFCOMM channel of a just-closed bootstrap can take several seconds to
         // clear in this head unit's Bluetooth service, so give the connect a wide window.
         private const val RFCOMM_CONNECT_ATTEMPTS = 6
