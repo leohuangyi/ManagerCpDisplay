@@ -46,7 +46,6 @@ class LocalAdb(context: Context) : Closeable {
     private val appContext = context.applicationContext
     private val cancelled = AtomicBoolean(false)
     private val closed = AtomicBoolean(false)
-    private val requestIds = AtomicLong(0)
     private val pending = ConcurrentHashMap<Long, Pending>()
     private val replyReceiver = ReplyReceiver()
     @Volatile private var interactive: InteractiveShell? = null
@@ -180,14 +179,28 @@ class LocalAdb(context: Context) : Closeable {
     }
 
     /**
-     * 请求小助手把车机媒体源切换到 [sourceId]（43=APPS，44=CarPlay）。仅投递不等待应答：
-     * 小助手 CpManager 收到后转发 MG_CHANGE_SOURCE_MANUAL 完成切换，其 RESULT 回执因无
-     * 对应 Pending 而被忽略。调用方通常用短期实例（`use`）发出即可。
+     * Requests the assistant's native Bluetooth audio source. This legacy overload only sends:
+     * the assistant forwards MG_CHANGE_SOURCE_MANUAL; its RESULT has no matching Pending and is
+     * ignored. Short-lived callers can keep using this fire-and-forget overload.
      */
     fun requestSourceSwitch() {
         broadcast(ACTION_CP_SWITCH_SOURCE) { intent ->
             intent.putExtra(EXTRA_REQUEST_ID, requestIds.incrementAndGet())
         }
+    }
+
+    /** Returns the assistant's bounded dispatch result, without claiming that the source applied. */
+    @Synchronized
+    fun requestSourceSwitch(timeoutMillis: Int): RootResult? {
+        if (cancelled.get() || closed.get()) return null
+        require(timeoutMillis in 1..MAX_COMMAND_TIMEOUT_MS)
+        val requestId = requestIds.incrementAndGet()
+        val result = Pending()
+        pending[requestId] = result
+        broadcast(ACTION_CP_SWITCH_SOURCE) { it.putExtra(EXTRA_REQUEST_ID, requestId) }
+        if (!awaitPending(result, requestId, timeoutMillis.toLong() + RESULT_GRACE_MILLIS)) return null
+        return if (result.error != null) RootResult(result.exit, result.error)
+            else RootResult(result.exit, result.output)
     }
 
     /** Exclusive interactive stream. Use a dedicated LocalAdb instance; never mix with [shell]. */
@@ -385,6 +398,11 @@ class LocalAdb(context: Context) : Closeable {
     private class StreamEvent(val line: String, val eof: Boolean)
 
     private companion object {
+        // Replies are addressed to the app package, so every live client receives them.
+        // Share command and session IDs across instances to keep their pending replies distinct.
+        // A new process must also avoid delayed replies to the previous process's requests.
+        private val requestIds = AtomicLong(System.nanoTime() and Long.MAX_VALUE)
+
         /** Lazily started, process-wide looper for reply broadcasts; daemon so it never blocks process death. */
         @Volatile
         private var replyLooperInstance: Looper? = null

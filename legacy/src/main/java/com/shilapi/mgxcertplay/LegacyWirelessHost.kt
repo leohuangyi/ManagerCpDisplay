@@ -3,7 +3,6 @@ package com.shilapi.mgxcertplay
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
@@ -11,10 +10,9 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.MotionEvent
 import android.view.Surface
+import com.shilapi.xcertplay.adb.LocalAdb
 import com.shilapi.xcertplay.media.AndroidMediaSink
 import com.shilapi.xcertplay.media.CarPlayTouchMapper
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 
 /**
  * Locale-independent status codes the host reports while booting the wireless link. The
@@ -50,6 +48,8 @@ object LegacyWirelessHost {
     private const val STAGE_NETWORK = 1
     private const val STAGE_IPHONE = 2
     private const val STAGE_CARPLAY = 3
+    private const val OP_OEM_WIAP_POLICY_DISABLE = "n9"
+    private const val OEM_WIAP_POLICY_TIMEOUT_MS = 15_000
 
     /**
      * How long [attachSurface] waits for the iPhone to re-establish the video stream before
@@ -177,6 +177,28 @@ object LegacyWirelessHost {
         videoWidth = align(width)
         videoHeight = align(height)
         val appContext = context.applicationContext
+        // The assistant owns this persistent, reversible OEM-wireless policy. Ordinary
+        // DiPlay exit must keep it applied, or OEM WIAP recreates the competing vehicle.
+        val policy = LocalAdb(appContext).use {
+            it.execOp(OP_OEM_WIAP_POLICY_DISABLE, null, OEM_WIAP_POLICY_TIMEOUT_MS)
+        }
+        val policyOutput = policy?.output.orEmpty()
+        val policyApplied = policy?.exit == 0 && policyOutput.startsWith("oemWiapDisabled=true;")
+        val policyNotApplicable = policy?.exit == 0 &&
+            policyOutput.startsWith("capability=not_applicable;")
+        if (!policyApplied && !policyNotApplicable) {
+            val detail = "OEM wireless iAP policy not confirmed; update/check assistant: " +
+                (policy?.output?.take(160) ?: "assistant unreachable or request timed out")
+            log(detail)
+            onStatus(StatusUpdate(HostStatus.CONNECTION_FAILED, detail))
+            return
+        }
+        if (policyApplied) {
+            log("OEM wireless iAP disabled by assistant policy; USB/HFP/A2DP remain available")
+        } else {
+            log("OEM wireless iAP control unavailable; OEM wireless state unconfirmed; continuing")
+        }
+        if (exiting) return
         val nextSink = AndroidMediaSink(
             surface = surface,
             videoWidth = videoWidth,
@@ -246,6 +268,18 @@ object LegacyWirelessHost {
         )
         built = next
         controller = next
+        try {
+            // Publish before the first pairing; this does not start network/authentication.
+            next.prepareBluetoothServices()
+        } catch (error: Throwable) {
+            log("Bluetooth service preparation failed: ${error.javaClass.simpleName}")
+            onStatus(StatusUpdate(HostStatus.CONNECTION_FAILED, "Bluetooth service preparation failed"))
+            if (controller === next) controller = null
+            runCatching { next.close() }
+            runCatching { nextSink.close() }
+            sink = null
+            return
+        }
         // A wedged resume cannot recover at the session layer: tearing the session down kills
         // the iAP2/RFCOMM transport, and only the bootstrap opens the RFCOMM listener. The
         // recovery is therefore a full wireless reboot, re-run against the newest surface.
@@ -544,9 +578,9 @@ object LegacyWirelessHost {
         }
         // 已连接的设备优先：CarPlay 刚打开时，正在通电话/放音乐的 iPhone 已经是 A2DP/HFP 连接态，
         // 应直接用它来链接，而不是不管连接状态就抓第一个已配对设备。
-        val connected = listOf(101, 2)
-            .flatMap { connectedDevices(context, adapter, it) }
-            .distinctBy { it.address }
+        val connected = LegacyBluetoothProfiles.connectedPhoneDevices(context) {
+            Log.w(TAG, it)
+        }
         if (connected.isNotEmpty()) {
             val chosen = connected.first()
             Log.i(TAG, "findPhone: ${connected.size} connected -> " +
@@ -580,32 +614,6 @@ object LegacyWirelessHost {
             bonded.joinToString { "${it.name ?: "<unnamed>"} (${it.address})" } +
             " ; picked ${chosen.name ?: "<unnamed>"} (${chosen.address})")
         return chosen
-    }
-
-    /** Queries the currently connected devices of one Bluetooth profile via its proxy. */
-    private fun connectedDevices(context: Context, adapter: BluetoothAdapter, profile: Int): List<BluetoothDevice> {
-        val latch = CountDownLatch(1)
-        var proxy: BluetoothProfile? = null
-        val listener = object : BluetoothProfile.ServiceListener {
-            override fun onServiceConnected(connectedProfile: Int, connectedProxy: BluetoothProfile) {
-                proxy = connectedProxy
-                latch.countDown()
-            }
-
-            override fun onServiceDisconnected(disconnectedProfile: Int) {
-                latch.countDown()
-            }
-        }
-        try {
-            if (!adapter.getProfileProxy(context, listener, profile)) return emptyList()
-            if (!latch.await(2, TimeUnit.SECONDS)) return emptyList()
-            return proxy?.connectedDevices ?: emptyList()
-        } catch (error: Throwable) {
-            Log.w(TAG, "connectedDevices(profile=$profile) failed", error)
-            return emptyList()
-        } finally {
-            proxy?.let { runCatching { adapter.closeProfileProxy(profile, it) } }
-        }
     }
 
     private fun align(value: Int): Int = (value / 2 * 2).coerceAtLeast(2)

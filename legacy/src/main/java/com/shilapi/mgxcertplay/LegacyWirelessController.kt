@@ -2,10 +2,11 @@ package com.shilapi.mgxcertplay
 
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.PowerManager
 import android.util.Base64
 import android.util.Log
@@ -25,16 +26,20 @@ import com.shilapi.xcertplay.mfi.LocalMfiAuthenticationClient
 import com.shilapi.xcertplay.network.CarPlayBonjourProtocol
 import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
 import com.shilapi.xcertplay.transport.BluetoothRfcommDuplexStream
+import com.shilapi.xcertplay.transport.BluetoothControlSocketOwner
 import com.shilapi.xcertplay.transport.Iap2IdentificationConfig
 import com.shilapi.xcertplay.transport.Iap2WirelessCarPlayEndpoint
 import com.shilapi.xcertplay.transport.Iap2WirelessControlClient
+import com.shilapi.xcertplay.transport.Iap2WirelessControlResult
 import com.shilapi.xcertplay.transport.Iap2WirelessIdentification
 import com.shilapi.xcertplay.transport.Iap2WirelessSecurity
+import com.shilapi.xcertplay.transport.WirelessBootstrapRecoveryPolicy
 import java.io.BufferedReader
 import java.io.Closeable
 import java.io.IOException
 import java.io.InputStreamReader
 import java.net.Inet4Address
+import java.net.Inet6Address
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
@@ -45,6 +50,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import javax.jmdns.JmDNS
 import javax.jmdns.ServiceEvent
 import javax.jmdns.ServiceInfo
@@ -71,6 +77,8 @@ class LegacyWirelessController(
     companion object {
         private const val TAG = "LegacyWireless"
         private const val RFCOMM_UUID = "00000000-deca-fade-deca-deafdecacafe"
+        private const val ACCESSORY_RFCOMM_UUID = "00000000-deca-fade-deca-deafdecacaff"
+        private const val CARPLAY_SERVICE_UUID = "ec884348-cd41-40a2-9727-575d50bf1fd3"
         private const val SOURCE_VERSION = "320.17.3"
         // The stale RFCOMM channel of a just-closed bootstrap can take several seconds to
         // clear in this head unit's Bluetooth service, so give the connect a wide window.
@@ -84,11 +92,10 @@ class LegacyWirelessController(
         private const val RFCOMM_SDP_RETRY_DELAY_MS = 4000L
         // Settle time after disconnecting HFP/A2DP before opening the CarPlay RFCOMM channel.
         private const val BLUETOOTH_PROFILE_SETTLE_MS = 2500L
-        // OEM profile ids. HFP is NOT the standard BluetoothProfile.HEADSET (1); this head unit
-        // runs HFP as BluetoothHeadsetHf (profile 101) inside system_server, so profile 1 can
-        // never reach the service that actually owns the RFCOMM channel. A2DP (2) is standard.
-        private const val PROFILE_HFP = 101
-        private const val PROFILE_A2DP = 2
+        // HF/client profiles are discovered from the running framework; HEADSET is the AG
+        // role and cannot stand in for a missing hands-free client API.
+        private val PROFILE_HFP = LegacyBluetoothProfiles.Role.HANDS_FREE
+        private val PROFILE_A2DP = LegacyBluetoothProfiles.Role.A2DP
         // BluetoothA2dp.PRIORITY_AUTO_CONNECT (hidden): set so the native stack also auto-reconnects.
         private const val A2DP_PRIORITY_AUTO_CONNECT = 1000
         // Rapid re-opens can leave the previous profile's RFCOMM/L2CAP channel half-torn-down, so a
@@ -104,6 +111,7 @@ class LegacyWirelessController(
         // switch has no completion ack, so a fixed settle window is used; if the connect still fails,
         // the system's own background connectSource re-links it later (~30s) as a fallback.
         private const val MEDIA_SOURCE_SWITCH_SETTLE_MS = 10_000L
+        private const val MEDIA_SOURCE_DISPATCH_TIMEOUT_MS = 5_000
         /** AirPlay resource id and changeModes transfer types for the CarPlay main screen. */
         private const val RESOURCE_ID_MAIN_SCREEN = 1
         private const val TRANSFER_BORROW = 3
@@ -120,6 +128,15 @@ class LegacyWirelessController(
     }
 
     private val closed = AtomicBoolean(false)
+    private val started = AtomicBoolean(false)
+    private val bluetoothControlLock = Any()
+    private val bluetoothServicePreparationLock = Any()
+    private var bluetoothServicesPrepared = false
+    private val bluetoothServices = CopyOnWriteArrayList<Closeable>()
+    private val bluetoothAcceptThreads = CopyOnWriteArrayList<Thread>()
+    private val bluetoothSocketOwner = BluetoothControlSocketOwner<ControlSocket> { it.close() }
+    /** Published before connect(), so close() also cancels a socket that has no stream yet. */
+    @Volatile private var connectingRfcommSocket: ControlSocket? = null
     /** The live RFCOMM control stream/session of the Bluetooth bootstrap, closed by [closeRfcomm]. */
     @Volatile private var rfcommStream: BluetoothRfcommDuplexStream? = null
     @Volatile private var rfcommSession: Iap2Session? = null
@@ -137,16 +154,30 @@ class LegacyWirelessController(
     private val wifiLocks = CopyOnWriteArrayList<WifiManager.WifiLock>()
     @Volatile private var multicastLock: WifiManager.MulticastLock? = null
     private val sessions = CopyOnWriteArrayList<AirPlaySession>()
+    private val acceptingAirPlay = AtomicInteger(0)
+    private val tunnelStreams = CopyOnWriteArrayList<BlockingDuplexByteStream>()
     @Volatile private var activeSession: AirPlaySession? = null
+
+    /**
+     * The OEM Bluetooth native implementation must see only one close, including races between
+     * connect cancellation, stream-construction failure, reader failure, and controller shutdown.
+     */
+    private class ControlSocket(val socket: BluetoothSocket) : Closeable {
+        private val closeStarted = AtomicBoolean(false)
+        val remoteDevice: BluetoothDevice get() = socket.remoteDevice
+        fun connect() = socket.connect()
+        override fun close() {
+            if (closeStarted.compareAndSet(false, true)) socket.close()
+        }
+    }
 
     private val sessionListener = object : AirPlaySessionListener {
         override fun onSessionActive(session: AirPlaySession) {
             activeSession = session
             log("AirPlay session active; waiting for video")
-            // CarPlay 控制会话建立后，请求小助手切到蓝牙媒体源(19)，让音频从蓝牙侧出来。每次新会话重新请求一次。
-            LocalAdb(context).use { it.requestSourceSwitch() }
-            // 媒体源切换完成后「先断开→再连接」HFP（A2DP 交给系统自管，不主动断开/重连）。
-            scheduleBluetoothProfileReconnectAfterMediaSourceSwitch()
+            // Dispatch and await native-source capability on a background thread. AirPlay's
+            // control thread must keep processing SETUP/commands while the assistant answers.
+            scheduleBluetoothProfileReconnectAfterMediaSourceSwitch(session)
         }
 
         override fun onSessionEnded(session: AirPlaySession) {
@@ -193,10 +224,15 @@ class LegacyWirelessController(
     }
 
     fun start(phone: BluetoothDevice) {
-        Thread({ bootstrap(phone) }, "legacy-carplay-start").apply {
-            isDaemon = true
-            bootstrapThread = this
-            start()
+        synchronized(bluetoothControlLock) {
+            if (closed.get() || !started.compareAndSet(false, true)) return
+            this.phone = phone
+            bluetoothSocketOwner.selectPeer(phone.address)
+            Thread({ bootstrap(phone) }, "legacy-carplay-start").apply {
+                isDaemon = true
+                bootstrapThread = this
+                start()
+            }
         }
     }
 
@@ -303,6 +339,10 @@ class LegacyWirelessController(
         wifiLocks += wifiLock
 
         val btMac = adapter.address ?: throw IllegalStateException("unable to read Bluetooth address")
+        // iAP2 over Bluetooth must identify with the same name as the radio's EIR Local Name.
+        // AirPlay Info still uses its protocol-required "CarPlay" name independently.
+        val btName = adapter.name?.takeIf { it.isNotBlank() }
+            ?: throw IllegalStateException("unable to read Bluetooth local name")
 
         // A cold start used to run its stages back to back; now only the hotspot bring-up (the
         // long pole) and MFi/media session setup run, in parallel and meeting at a latch. HFP is
@@ -347,47 +387,85 @@ class LegacyWirelessController(
         }
         failures.firstOrNull()?.let { throw it }
         val readyEndpoint = endpoint ?: throw IllegalStateException("Network endpoint unavailable")
-        val setup = parts ?: throw IllegalStateException("Session setup unavailable")
+        val prepared = parts ?: throw IllegalStateException("Session setup unavailable")
+        // The AP interface can differ between ROMs. Resolve one identity from the actual
+        // prepared endpoint, then use it consistently for /info, Bonjour and 0x4301.
+        val endpointDeviceId = deviceId(readyEndpoint.iface)
+        val setup = SessionParts(
+            prepared.config.copy(deviceId = endpointDeviceId), prepared.identity, prepared.pairings,
+            prepared.mfi, prepared.mfiClient, prepared.media, endpointDeviceId,
+        )
 
         val identification = Iap2IdentificationConfig(
-            name = "CarPlay",
+            name = btName,
             modelIdentifier = "CarPlay",
             manufacturer = "CarPlay",
             serialNumber = setup.identity.pairingId,
-            firmwareVersion = "0.21",
-            hardwareVersion = "iMX6",
-            wireless = Iap2WirelessIdentification(btMac, readyEndpoint.ssid),
+            firmwareVersion = runCatching {
+                context.packageManager.getPackageInfo(context.packageName, 0).versionName
+            }.getOrNull()?.takeIf { it.isNotBlank() } ?: SOURCE_VERSION,
+            hardwareVersion = Build.HARDWARE.takeIf { it.isNotBlank() }
+                ?: Build.DEVICE.takeIf { it.isNotBlank() } ?: "Android",
+            wireless = Iap2WirelessIdentification(
+                btMac,
+                readyEndpoint.ssid,
+                // Only advertise implemented standard transport capabilities on this receiver.
+                includeExtendedTransportParameters = false,
+                includeLegacyConnectionMessages = false,
+            ),
         )
         val wirelessEndpoint = Iap2WirelessCarPlayEndpoint(
             ssid = readyEndpoint.ssid,
             passphrase = readyEndpoint.password,
             channel = readyEndpoint.channel,
             security = Iap2WirelessSecurity.WPA_WPA2,
-            ipAddresses = readyEndpoint.addresses.map { it.hostAddress!!.substringBefore('%') },
+            // Wireless CarPlay's IPAddress field names the Wi-Fi IPv6 link-local endpoint.
+            // Keep IPv4 listeners for compatibility, and only advertise IPv4 as a fallback.
+            ipAddresses = readyEndpoint.addresses.filterIsInstance<Inet6Address>()
+                .ifEmpty { readyEndpoint.addresses }
+                .map { it.hostAddress!!.substringBefore('%') },
             airPlayPort = setup.config.port,
             deviceIdentifier = setup.deviceId,
-            publicKey = setup.identity.publicKeyHex,
+            // 0x4301 calls this field PublicKey, but it carries the pairing identity (Bonjour pi).
+            publicKey = setup.identity.pairingId,
             sourceVersion = setup.config.sourceVersion,
         )
 
         setup.media.setIapTunnelHandler { stream: BlockingDuplexByteStream ->
-            if (closed.get()) {
+            val accepted = synchronized(bluetoothControlLock) {
+                if (closed.get()) false else {
+                    tunnelStreams += stream
+                    true
+                }
+            }
+            if (!accepted) {
                 false
             } else {
                 log("Wi-Fi iAP2 tunnel request accepted")
                 val tunnelThread = Thread({
+                    var tunnelSession: Iap2Session? = null
                     try {
-                        val session = Iap2Session.openTunnel(stream)
+                        val session = Iap2Session.openTunnel(stream).also { tunnelSession = it }
                         log("Wi-Fi iAP2 tunnel established")
-                        Iap2WirelessControlClient(session, setup.mfiClient).run(
+                        val result = Iap2WirelessControlClient(session, setup.mfiClient).run(
                             identification = identification,
                             endpoint = wirelessEndpoint,
                             onReady = { log("Wi-Fi iAP2 authenticated; control tunnel ready") },
+                            keepAliveAfterDeadline = { !closed.get() && activeSession != null },
                             onProgress = { log("Wi-Fi: $it") },
                         )
+                        logControlResult("Wi-Fi", result)
                     } catch (e: Throwable) {
-                        if (!closed.get()) failure("Wi-Fi iAP2", e)
+                        if (!closed.get()) {
+                            if (hasAirPlayConnection()) {
+                                log("Wi-Fi iAP2 control ended during AirPlay; preserving session: ${e.message}")
+                            } else {
+                                failure("Wi-Fi iAP2", e)
+                            }
+                        }
                     } finally {
+                        tunnelStreams.remove(stream)
+                        runCatching { tunnelSession?.close() }
                         runCatching { stream.close() }
                     }
                 }, "legacy-iap-tunnel")
@@ -446,9 +524,107 @@ class LegacyWirelessController(
             controlServiceListener(readyEndpoint.address, setup.config, setup.deviceId),
         )
 
+        prepareBluetoothServices()
         log("listening on ${readyEndpoint.iface.name}; starting Bluetooth handshake")
         runBluetoothBootstrap(phone, setup.mfiClient, identification, wirelessEndpoint)
-        log("Bluetooth bootstrap ended; waiting for Wi-Fi session")
+        // Outbound connection retries remain bounded. A later authenticated phone-initiated
+        // connection is a new event and can still use the prepared Wi-Fi/iAP2 engine.
+        while (!closed.get() && !hasWirelessHandoff()) {
+            if (!bluetoothSocketOwner.awaitIncoming()) return
+            if (closed.get() || hasWirelessHandoff()) return
+            val result = runBluetoothControlAttempt(
+                phone, setup.mfiClient, identification, wirelessEndpoint,
+                recovering = true, incomingOnly = true,
+            )
+            if (result != null) logControlResult("Bluetooth incoming", result)
+        }
+    }
+
+    /**
+     * Publish the accessory iAP2/CarPlay services before the host waits for its first pairing.
+     * Accepted sockets wait for phone selection and network preparation; only the bootstrap
+     * worker may consume them and run identification/authentication.
+     */
+    fun prepareBluetoothServices() = synchronized(bluetoothServicePreparationLock) {
+        if (bluetoothServicesPrepared || closed.get()) return@synchronized
+        val adapter = BluetoothAdapter.getDefaultAdapter()
+            ?: throw IllegalStateException("Android Bluetooth is unavailable")
+        check(adapter.isEnabled) { "please enable Bluetooth first" }
+        val name = adapter.name?.takeIf { it.isNotBlank() }
+            ?: throw IllegalStateException("unable to read Bluetooth local name")
+        val added = ArrayList<Closeable>()
+        try {
+            for ((label, uuid) in listOf(
+                "iAP2 accessory (caff)" to ACCESSORY_RFCOMM_UUID,
+                "CarPlay (ec88)" to CARPLAY_SERVICE_UUID,
+            )) {
+                if (closed.get()) return@synchronized
+                val server = adapter.listenUsingRfcommWithServiceRecord(name, UUID.fromString(uuid))
+                // The OEM API 17 socket does not implement Closeable. Wrap it and guard close
+                // because preparation failure and controller shutdown may race each other.
+                val serverClosed = AtomicBoolean(false)
+                val resource = Closeable {
+                    if (serverClosed.compareAndSet(false, true)) server.close()
+                }
+                val retained = synchronized(bluetoothControlLock) {
+                    if (closed.get()) false else {
+                        bluetoothServices += resource
+                        added += resource
+                        true
+                    }
+                }
+                if (!retained) {
+                    runCatching { resource.close() }
+                    return@synchronized
+                }
+                Thread({ acceptBluetoothConnections(server, resource, label) }, "legacy-bt-accept-$label").apply {
+                    isDaemon = true
+                    bluetoothAcceptThreads += this
+                    start()
+                }
+                log("Bluetooth SDP/EIR service $label registered; accepting connections")
+            }
+            bluetoothServicesPrepared = true
+        } catch (error: Throwable) {
+            added.forEach {
+                bluetoothServices.remove(it)
+                runCatching { it.close() }
+            }
+            throw error
+        }
+    }
+
+    private fun acceptBluetoothConnections(server: BluetoothServerSocket, resource: Closeable, label: String) {
+        try {
+            while (!closed.get()) {
+                val socket = try {
+                    ControlSocket(server.accept())
+                } catch (error: IOException) {
+                    if (!closed.get()) log("Bluetooth service $label accept ended: ${error.javaClass.simpleName}")
+                    return
+                }
+                val accepted = try {
+                    val peer = socket.remoteDevice
+                    if (closed.get() || peer.bondState != BluetoothDevice.BOND_BONDED || hasWirelessHandoff()) {
+                        runCatching { socket.close() }
+                        false
+                    } else {
+                        bluetoothSocketOwner.offerIncoming(peer.address, socket)
+                    }
+                } catch (error: Exception) {
+                    runCatching { socket.close() }
+                    if (!closed.get()) log("Bluetooth incoming peer check failed: ${error.javaClass.simpleName}")
+                    false
+                }
+                if (closed.get()) return
+                log(if (accepted) "Bluetooth incoming $label queued for control" else
+                    "Bluetooth incoming $label rejected: unselected, unpaired, duplicate, or Wi-Fi active")
+            }
+        } finally {
+            // Never leave an advertised RFCOMM channel without an accept worker.
+            runCatching { resource.close() }
+            bluetoothServices.remove(resource)
+        }
     }
 
     /**
@@ -467,9 +643,9 @@ class LegacyWirelessController(
     )
 
     /**
-     * Builds the session parts on their own track. The wlan0 MAC is static in the firmware, so
-     * the device id can be resolved before the hotspot is up; the nil-interface fallback in
-     * [deviceId] keeps the stored id. MFi asset installation moved here from the host so it
+     * Builds the session parts on their own track. The network-independent identity below is
+     * provisional; bootstrap replaces it with the prepared AP interface identity before any
+     * listener advertises it. MFi asset installation moved here from the host so it
      * overlaps the hotspot bring-up instead of preceding it.
      */
     private fun prepareSession(btMac: String): SessionParts {
@@ -480,7 +656,7 @@ class LegacyWirelessController(
         val mfi = LocalMfiAuthenticationClient.load(LocalMfiAuthenticationClient.offlineDirectory(context))
         val mfiClient = Iap2MfiAuthenticationClient(mfi)
 
-        val deviceId = deviceId(NetworkInterface.getByName("wlan0"))
+        val deviceId = deviceId(null)
 
         val config = AirPlayConfig(
             deviceName = "CarPlay",
@@ -520,123 +696,75 @@ class LegacyWirelessController(
     }
 
     /** Disconnects [phone] from one Bluetooth profile via the public (@hide) disconnect method. */
-    private fun disconnectProfile(phone: BluetoothDevice, profile: Int, label: String) {
-        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return
-        val latch = CountDownLatch(1)
-        var proxy: BluetoothProfile? = null
-        val listener = object : BluetoothProfile.ServiceListener {
-            override fun onServiceConnected(connectedProfile: Int, connectedProxy: BluetoothProfile) {
-                proxy = connectedProxy
-                latch.countDown()
-            }
-
-            override fun onServiceDisconnected(disconnectedProfile: Int) {
-                latch.countDown()
-            }
-        }
-        try {
-            if (!adapter.getProfileProxy(context, listener, profile)) {
-                log("$label proxy request rejected; skipping disconnect")
-                return
-            }
-            if (!latch.await(3, TimeUnit.SECONDS) || proxy == null) {
-                log("$label proxy unavailable; skipping disconnect")
-                return
-            }
-            val p = proxy!!
+    private fun disconnectProfile(
+        phone: BluetoothDevice,
+        profile: LegacyBluetoothProfiles.Role,
+        label: String,
+        stillNeeded: () -> Boolean = { !closed.get() },
+    ) {
+        LegacyBluetoothProfiles.withProfile(context, profile, phone, log) { handle ->
+            if (!stillNeeded()) return@withProfile
+            val p = handle.proxy
             if (p.connectedDevices.contains(phone)) {
                 log("Disconnecting $label from iPhone")
-                p.javaClass.getMethod("disconnect", BluetoothDevice::class.java).invoke(p, phone)
-                log("$label disconnect requested")
+                val accepted = handle.disconnect(phone)
+                log("$label disconnect requested accepted=$accepted profile=${handle.id}")
             } else {
                 log("$label not connected to iPhone; nothing to disconnect")
             }
-        } catch (error: Throwable) {
-            log("$label disconnect failed: ${error.javaClass.simpleName}: ${error.message}")
-        } finally {
-            proxy?.let { runCatching { adapter.closeProfileProxy(profile, it) } }
         }
     }
 
     /** Connects [phone] to one Bluetooth profile via the OEM @hide connect path, retrying on failure.
      *  Returns true once the profile reached the connected state, false when it gave up. */
-    private fun connectProfile(phone: BluetoothDevice, profile: Int, label: String): Boolean {
-        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return false
-        val latch = CountDownLatch(1)
-        var proxy: BluetoothProfile? = null
-        val listener = object : BluetoothProfile.ServiceListener {
-            override fun onServiceConnected(connectedProfile: Int, connectedProxy: BluetoothProfile) {
-                proxy = connectedProxy
-                latch.countDown()
-            }
-
-            override fun onServiceDisconnected(disconnectedProfile: Int) {
-                latch.countDown()
-            }
-        }
-        try {
-            if (!adapter.getProfileProxy(context, listener, profile)) {
-                log("$label proxy request rejected; skipping connect")
-                return false
-            }
-            if (!latch.await(3, TimeUnit.SECONDS) || proxy == null) {
-                log("$label proxy unavailable; skipping connect")
-                return false
-            }
-            val p = proxy!!
+    private fun connectProfile(
+        phone: BluetoothDevice,
+        profile: LegacyBluetoothProfiles.Role,
+        label: String,
+        stillNeeded: () -> Boolean = { !closed.get() },
+    ): Boolean =
+        LegacyBluetoothProfiles.withProfile(context, profile, phone, log) { handle ->
+            if (!stillNeeded()) return@withProfile false
+            val p = handle.proxy
             if (p.connectedDevices.contains(phone)) {
                 log("$label already connected to iPhone; nothing to connect")
-                return true
+                return@withProfile true
             }
-            // OEM connectDeviceAllowRePairing (z2=true) semantics, mapped to the methods that
-            // actually exist on this ROM's @hide proxies (verified via runtime NoSuchMethodException):
-            // HFP (BluetoothHeadsetHf, profile 101) has NO connectAllowRePairing -- the allowRePairing
-            // variant is the two-arg connect(BluetoothDevice, boolean)=true; A2DP (profile 2) only has
-            // the plain connect(BluetoothDevice). Both are @hide, hence reflection.
+            // The hands-free API owns its discovered connect signature; A2DP uses the standard
+            // profile and its optional priority method. No numeric HF profile or car-model table.
             repeat(PROFILE_CONNECT_RETRIES) { attempt ->
+                if (!stillNeeded()) return@withProfile false
                 try {
-                    when (profile) {
-                        PROFILE_HFP -> p.javaClass.getMethod(
-                            "connect", BluetoothDevice::class.java, Boolean::class.javaPrimitiveType
-                        ).invoke(p, phone, true)
-
-                        PROFILE_A2DP -> {
-                            // 原厂 Settings 连接前把优先级设为 AUTO_CONNECT，让蓝牙栈后台也能自动重连。
-                            runCatching {
-                                p.javaClass.getMethod(
-                                    "setPriority", BluetoothDevice::class.java, Int::class.javaPrimitiveType
-                                ).invoke(p, phone, A2DP_PRIORITY_AUTO_CONNECT)
-                            }.onSuccess {
-                                log("$label priority set to AUTO_CONNECT($A2DP_PRIORITY_AUTO_CONNECT)")
-                            }.onFailure { error ->
-                                log("$label setPriority failed: ${error.javaClass.simpleName}: ${error.message}")
-                            }
+                    if (profile == PROFILE_A2DP) {
+                        // Keep the native stack's normal background auto-connect policy.
+                        runCatching {
                             p.javaClass.getMethod(
-                                "connect", BluetoothDevice::class.java
-                            ).invoke(p, phone)
-                        }
-
-                        else -> {
-                            log("$label has no OEM connect method; skipping")
-                            return false
+                                "setPriority", BluetoothDevice::class.java, Int::class.javaPrimitiveType
+                            ).invoke(p, phone, A2DP_PRIORITY_AUTO_CONNECT)
+                        }.onSuccess {
+                            log("$label priority set to AUTO_CONNECT($A2DP_PRIORITY_AUTO_CONNECT)")
+                        }.onFailure { error ->
+                            log("$label setPriority failed: ${error.javaClass.simpleName}: ${error.message}")
                         }
                     }
-                    log("$label connect requested (attempt ${attempt + 1}/$PROFILE_CONNECT_RETRIES)")
+                    val accepted = handle.connect(phone)
+                    log("$label connect requested accepted=$accepted profile=${handle.id} " +
+                        "(attempt ${attempt + 1}/$PROFILE_CONNECT_RETRIES)")
 
                     // Poll for the connected state instead of trusting the fire-and-forget connect():
                     // the rapid-reopen path can drop a fresh connect from STATE_CONNECTING straight
                     // back to disconnected, and only a re-issue once things settle recovers it.
                     val deadline = System.currentTimeMillis() + PROFILE_CONNECT_ATTEMPT_TIMEOUT_MS
-                    while (System.currentTimeMillis() < deadline && !closed.get()) {
+                    while (System.currentTimeMillis() < deadline && stillNeeded()) {
                         if (p.connectedDevices.contains(phone)) {
                             log("$label connected")
-                            return true
+                            return@withProfile true
                         }
                         try {
                             Thread.sleep(PROFILE_CONNECT_POLL_MS)
                         } catch (_: InterruptedException) {
                             Thread.currentThread().interrupt()
-                            return false
+                            return@withProfile false
                         }
                     }
                     if (!closed.get()) log("$label not connected after attempt ${attempt + 1}")
@@ -645,22 +773,16 @@ class LegacyWirelessController(
                 }
             }
             log("$label connect gave up after $PROFILE_CONNECT_RETRIES attempts")
-            return false
-        } catch (error: Throwable) {
-            log("$label connect failed: ${error.javaClass.simpleName}: ${error.message}")
-            return false
-        } finally {
-            proxy?.let { runCatching { adapter.closeProfileProxy(profile, it) } }
-        }
-    }
+            false
+        } ?: false
 
     /**
-     * Re-links only HFP after the media source has switched to Bluetooth (19). A2DP is intentionally
+     * Re-links only HFP after dispatching the native Bluetooth audio source. A2DP is intentionally
      * left untouched: on this head unit the profile 2 proxy misreports connectedDevices (it said
      * "not connected" while BluetoothA2dpService was still streaming), so a disconnect would be a
-     * no-op and the follow-up connect doomed. Only the OEM HFP (profile 101) is re-linked here.
+     * no-op and the follow-up connect doomed. Only a discovered HF/client profile is re-linked.
      */
-    private fun reconnectBluetoothProfiles() {
+    private fun reconnectBluetoothProfiles(session: AirPlaySession) {
         val phone = this.phone ?: return
         if (!bluetoothProfilesReconnected.compareAndSet(false, true)) {
             log("Native Bluetooth profiles already queued; skipping re-link")
@@ -668,16 +790,20 @@ class LegacyWirelessController(
         }
         log("Queueing native HFP re-link (disconnect then reconnect)")
         Thread({
-            if (closed.get()) return@Thread
-            disconnectProfile(phone, PROFILE_HFP, "HFP")
+            if (closed.get() || activeSession !== session) return@Thread
+            disconnectProfile(phone, PROFILE_HFP, "HFP") { !closed.get() && activeSession === session }
             try {
                 Thread.sleep(BLUETOOTH_PROFILE_SETTLE_MS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
                 return@Thread
             }
-            if (closed.get()) return@Thread
-            Thread({ if (!closed.get()) connectProfile(phone, PROFILE_HFP, "HFP") }, "legacy-profile-hfp").apply {
+            if (closed.get() || activeSession !== session) return@Thread
+            Thread({
+                if (!closed.get() && activeSession === session) {
+                    connectProfile(phone, PROFILE_HFP, "HFP") { !closed.get() && activeSession === session }
+                }
+            }, "legacy-profile-hfp").apply {
                 isDaemon = true
                 start()
             }
@@ -688,23 +814,34 @@ class LegacyWirelessController(
     }
 
     /**
-     * Re-links native HFP only after the media source has finished switching to the Bluetooth
-     * audio source (19). The switch has no completion ack (the assistant replies exit=0 as soon as
-     * it forwards MG_CHANGE_SOURCE_MANUAL), so a fixed settle window is used. If
+     * Re-links native HFP only after the assistant confirms it dispatched the discovered native
+     * Bluetooth audio source. This is not a source-applied ack, so the existing settle window
+     * remains. Missing capabilities, stale sessions and shutdown leave HFP untouched. If
      * [reconnectBluetoothProfiles] already ran this becomes a no-op.
      */
-    private fun scheduleBluetoothProfileReconnectAfterMediaSourceSwitch() {
+    private fun scheduleBluetoothProfileReconnectAfterMediaSourceSwitch(session: AirPlaySession) {
         Thread({
+            if (closed.get() || activeSession !== session) return@Thread
+            val result = LocalAdb(context).use {
+                it.requestSourceSwitch(MEDIA_SOURCE_DISPATCH_TIMEOUT_MS)
+            }
+            if (closed.get() || activeSession !== session) return@Thread
+            if (result?.exit != 0 || !result?.output.orEmpty().startsWith("dispatched;sourceId=")) {
+                log("Native Bluetooth source dispatch unconfirmed; leaving HFP connected")
+                return@Thread
+            }
+            log("Native Bluetooth source dispatched; settling before HFP re-link")
             try {
                 Thread.sleep(MEDIA_SOURCE_SWITCH_SETTLE_MS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
                 return@Thread
             }
-            if (closed.get()) return@Thread
-            reconnectBluetoothProfiles()
+            if (closed.get() || activeSession !== session) return@Thread
+            reconnectBluetoothProfiles(session)
         }, "legacy-profile-reconnect-after-source").apply {
             isDaemon = true
+            trackThreads += this
             start()
         }
     }
@@ -754,17 +891,32 @@ class LegacyWirelessController(
                     failure("AirPlay listen", e)
                     return
                 }
+                acceptingAirPlay.incrementAndGet()
                 try {
+                    if (closed.get()) {
+                        socket.close()
+                        return
+                    }
                     log("received AirPlay TCP connection")
                     socket.tcpNoDelay = true
                     socket.keepAlive = true
-                    val session = AirPlaySession(socket, config, identity, pairings, mfi, sessionListener, media)
-                    sessions += session
+                    val session = synchronized(bluetoothControlLock) {
+                        if (closed.get()) null else {
+                            AirPlaySession(socket, config, identity, pairings, mfi, sessionListener, media)
+                                .also { sessions += it }
+                        }
+                    }
+                    if (session == null) {
+                        socket.close()
+                        return
+                    }
                     session.start()
                 } catch (e: Throwable) {
                     runCatching { socket.close() }
                     if (closed.get()) return
                     failure("AirPlay session", e)
+                } finally {
+                    acceptingAirPlay.decrementAndGet()
                 }
             }
         } finally {
@@ -782,34 +934,160 @@ class LegacyWirelessController(
         identification: Iap2IdentificationConfig,
         endpoint: Iap2WirelessCarPlayEndpoint,
     ) {
+        for (controlAttempt in 1..WirelessBootstrapRecoveryPolicy.MAX_ATTEMPTS) {
+            if (closed.get()) return
+            if (controlAttempt > 1 && hasWirelessHandoff()) {
+                log("Bluetooth retry cancelled; Wi-Fi handoff already in progress")
+                return
+            }
+            log("Bluetooth control attempt $controlAttempt/${WirelessBootstrapRecoveryPolicy.MAX_ATTEMPTS}")
+            val result = runBluetoothControlAttempt(
+                phone, mfiClient, identification, endpoint, recovering = controlAttempt > 1,
+            ) ?: return
+            logControlResult("Bluetooth attempt $controlAttempt", result)
+            val decision = WirelessBootstrapRecoveryPolicy.afterControlEnded(
+                completedAttempts = controlAttempt,
+                closed = closed.get(),
+                airPlayConnected = hasAirPlayConnection(),
+                wifiTunnelConnected = tunnelStreams.isNotEmpty(),
+            )
+            when (decision.action) {
+                WirelessBootstrapRecoveryPolicy.Action.CLOSED -> return
+                WirelessBootstrapRecoveryPolicy.Action.HANDOFF -> {
+                    log("Bluetooth control ended during Wi-Fi handoff; preserving AirPlay and listeners")
+                    return
+                }
+                WirelessBootstrapRecoveryPolicy.Action.EXHAUSTED -> {
+                    // Failure reporting updates the UI; the network and listeners stay available
+                    // if the iPhone finishes joining after the final bounded attempt.
+                    if (!closed.get() && !hasWirelessHandoff()) {
+                        failure("Bluetooth bootstrap", IOException(
+                            "${result.terminal} at ${result.stage} after $controlAttempt attempts; " +
+                                "iPhone has not opened a Wi-Fi CarPlay connection",
+                        ))
+                    }
+                    return
+                }
+                WirelessBootstrapRecoveryPolicy.Action.RETRY -> {
+                    log("Bluetooth ${result.terminal} at ${result.stage}; " +
+                        "retrying control in ${decision.retryDelayMillis}ms with hotspot and listeners preserved")
+                    if (!waitForBluetoothRetry(decision.retryDelayMillis)) return
+                }
+            }
+        }
+    }
+
+    private fun hasAirPlayConnection(): Boolean =
+        activeSession != null || acceptingAirPlay.get() > 0 || sessions.isNotEmpty()
+
+    private fun hasWirelessHandoff(): Boolean = hasAirPlayConnection() || tunnelStreams.isNotEmpty()
+
+    /** Interruptible backoff also notices a Wi-Fi handoff without opening another RFCOMM link. */
+    private fun waitForBluetoothRetry(delayMillis: Long): Boolean {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delayMillis)
+        while (!closed.get()) {
+            if (hasWirelessHandoff()) {
+                log("Bluetooth retry cancelled; Wi-Fi handoff arrived during backoff")
+                return false
+            }
+            val remaining = deadline - System.nanoTime()
+            if (remaining <= 0L) return true
+            try {
+                Thread.sleep(minOf(250L, maxOf(1L, TimeUnit.NANOSECONDS.toMillis(remaining))))
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+        }
+        return false
+    }
+
+    private fun logControlResult(transport: String, result: Iap2WirelessControlResult) {
+        log("$transport control ended: terminal=${result.terminal} stage=${result.stage} " +
+            "wifiConfigs=${result.wifiConfigurationsSent} startSessions=${result.carPlayStartSessionsSent} " +
+            "transportNotified=${result.transportNotificationSeen} " +
+            "postTransportConfigs=${result.postTransportWiFiConfigurationsSent} " +
+            "airPlayConnected=${hasAirPlayConnection()} wifiTunnels=${tunnelStreams.size}")
+    }
+
+    private fun runBluetoothControlAttempt(
+        phone: BluetoothDevice,
+        mfiClient: Iap2MfiAuthenticationClient,
+        identification: Iap2IdentificationConfig,
+        endpoint: Iap2WirelessCarPlayEndpoint,
+        recovering: Boolean,
+        incomingOnly: Boolean = false,
+    ): Iap2WirelessControlResult? {
         // This head unit kills a backgrounded process within seconds; when CarPlay was running
         // the Bluetooth service still holds the phone's RFCOMM channel and a fresh connect
         // fails with "Device or resource busy". One socket per attempt plus a short wait lets
         // that stale state clear. HFP is not disconnected up front anymore: only if a connect
         // fails with EBUSY do we clear the HFP RFCOMM once, then retry. Only the connect stage
-        // retries: a dropped established session is a real failure, and the Wi-Fi tunnel keeps
-        // the session alive anyway.
+        // retries here. The outer loop separately handles an ended iAP2 control result.
         var attempt = 0
         var hfpClearedOnBusy = false
-        var connected: BluetoothSocket? = null
+        var connected: ControlSocket? = null
         var stream: BluetoothRfcommDuplexStream? = null
+        var controlSession: Iap2Session? = null
         try {
             while (connected == null && !closed.get()) {
+                if (recovering && hasWirelessHandoff()) {
+                    log("Bluetooth retry cancelled; Wi-Fi handoff already in progress")
+                    return null
+                }
+                val incoming = bluetoothSocketOwner.takeIncoming()
+                if (incoming != null) {
+                    connected = incoming
+                    val peer = incoming.remoteDevice
+                    // A bond can disappear while an early incoming socket waits for the AP.
+                    if (peer.bondState != BluetoothDevice.BOND_BONDED ||
+                        !peer.address.equals(phone.address, ignoreCase = true)) {
+                        runCatching { incoming.close() }
+                        bluetoothSocketOwner.release(incoming)
+                        connected = null
+                        continue
+                    }
+                    log("Bluetooth RFCOMM connected (phone initiated)")
+                    break
+                }
+                if (incomingOnly) return null
                 attempt += 1
-                val candidate = phone.createRfcommSocketToServiceRecord(UUID.fromString(RFCOMM_UUID))
+                val candidate = ControlSocket(phone.createRfcommSocketToServiceRecord(UUID.fromString(RFCOMM_UUID)))
+                // An incoming socket may have arrived between takeIncoming and this creation.
+                // It wins before any second control handshake can start.
+                if (!bluetoothSocketOwner.beginOutgoing(phone.address, candidate)) {
+                    if (closed.get()) return null
+                    continue
+                }
+                synchronized(bluetoothControlLock) {
+                    if (closed.get()) {
+                        runCatching { candidate.close() }
+                        return null
+                    }
+                    connectingRfcommSocket = candidate
+                }
                 try {
                     candidate.connect()
+                    if (!bluetoothSocketOwner.outgoingConnected(candidate)) {
+                        if (closed.get()) return null
+                        continue
+                    }
                     connected = candidate
-                    if (closed.get()) {
-                        // close() won while connect was in flight. The bootstrap thread owns
-                        // this socket until it is handed to the stream below, so it must be
-                        // the one to close it here.
+                    if (closed.get() || (recovering && hasWirelessHandoff())) {
+                        // Exit or Wi-Fi handoff won while the retry was connecting. This is
+                        // still this attempt's socket; do not start another iAP2 handshake.
                         runCatching { candidate.close() }
-                        return
+                        return null
                     }
                     log(if (attempt > 1) "Bluetooth RFCOMM connected on attempt $attempt" else "Bluetooth RFCOMM connected")
                 } catch (e: IOException) {
+                    bluetoothSocketOwner.outgoingFailed(candidate)
                     runCatching { candidate.close() }
+                    if (closed.get() || (recovering && hasWirelessHandoff())) return null
+                    if (bluetoothSocketOwner.hasIncoming()) {
+                        log("Bluetooth incoming connection replaced pending outbound connect")
+                        continue
+                    }
                     val message = e.message ?: ""
                     // EBUSY and SDP failure need different back-offs: EBUSY means a stale OEM
                     // RFCOMM/L2CAP link is still clearing, SDP failure means the iPhone has not
@@ -821,9 +1099,10 @@ class LegacyWirelessController(
                         message.contains("Service discovery", ignoreCase = true) -> RFCOMM_SDP_RETRY_DELAY_MS
                         else -> RFCOMM_CONNECT_RETRY_DELAY_MS
                     }
-                    // HFP is not disconnected up front; on the first EBUSY clear the OEM HFP
-                    // RFCOMM channel once and let the retry connect cleanly.
-                    if (busy && !hfpClearedOnBusy) {
+                    // Only the initial bootstrap may clear HFP. Recovery already completed a
+                    // Bluetooth handshake once; touching profiles now could disturb a Wi-Fi
+                    // handoff that arrives while the profile proxy is being obtained.
+                    if (busy && !recovering && !hfpClearedOnBusy) {
                         hfpClearedOnBusy = true
                         log("Bluetooth RFCOMM busy; clearing HFP channel before retry")
                         disconnectProfile(phone, PROFILE_HFP, "HFP")
@@ -833,43 +1112,80 @@ class LegacyWirelessController(
                         try {
                             Thread.sleep(delay)
                         } catch (_: InterruptedException) {
-                            return
+                            Thread.currentThread().interrupt()
+                            return null
                         }
                     } else {
                         if (!closed.get()) failure("Bluetooth bootstrap", e)
-                        return
+                        return null
+                    }
+                } finally {
+                    if (connected !== candidate) {
+                        bluetoothSocketOwner.outgoingFailed(candidate)
+                        runCatching { candidate.close() }
+                    }
+                    synchronized(bluetoothControlLock) {
+                        if (connectingRfcommSocket === candidate && connected !== candidate) {
+                            connectingRfcommSocket = null
+                        }
                     }
                 }
             }
-            val socket = connected ?: return
+            val socket = connected ?: return null
+            if (closed.get() || (recovering && hasWirelessHandoff())) return null
             // Publish the stream before the session so a close() racing this window reaches
             // the socket through the stream, not through a half-built session.
-            val rfcomm = BluetoothRfcommDuplexStream(socket) { log("rfcomm: $it") }
-            rfcommStream = rfcomm
+            val rfcomm = BluetoothRfcommDuplexStream(
+                socket.socket, { log("rfcomm: $it") }, { socket.close() },
+            )
             stream = rfcomm
-            val session = Iap2Session.openWireless(rfcomm)
-            rfcommSession = session
-            Iap2WirelessControlClient(session, mfiClient).run(
+            synchronized(bluetoothControlLock) {
+                if (closed.get()) return null
+                rfcommStream = rfcomm
+                connectingRfcommSocket = null
+            }
+            val session = Iap2Session.openWireless(rfcomm).also { controlSession = it }
+            synchronized(bluetoothControlLock) {
+                if (closed.get() || (recovering && hasWirelessHandoff())) {
+                    runCatching { session.close() }
+                    return null
+                }
+                rfcommSession = session
+            }
+            return Iap2WirelessControlClient(session, mfiClient).run(
                 identification = identification,
                 endpoint = endpoint,
                 onReady = {
                     log("Bluetooth bootstrap ready; handing off to Wi-Fi")
                 },
+                keepAliveAfterDeadline = { !closed.get() && activeSession != null },
                 onProgress = { log("Bluetooth: $it") },
             )
         } catch (e: Throwable) {
-            if (!closed.get()) failure("Bluetooth bootstrap", e)
+            if (!closed.get()) {
+                if (hasWirelessHandoff()) {
+                    log("Bluetooth control ended during Wi-Fi handoff; preserving session: ${e.message}")
+                } else {
+                    failure("Bluetooth bootstrap", e)
+                }
+            }
+            return null
         } finally {
             // Detach before closing so a later run starts with a fresh channel; the stream owns
             // the socket and closes it idempotently. For a socket that never made it into a
             // stream (exit raced the hand-over), this thread still owns it and closes it directly.
-            rfcommStream = null
-            rfcommSession = null
+            synchronized(bluetoothControlLock) {
+                rfcommStream = null
+                rfcommSession = null
+                connectingRfcommSocket = null
+            }
+            runCatching { controlSession?.close() }
             if (stream != null) {
                 runCatching { stream.close() }
             } else {
                 runCatching { connected?.close() }
             }
+            connected?.let { bluetoothSocketOwner.release(it) }
         }
     }
 
@@ -969,7 +1285,13 @@ class LegacyWirelessController(
     }
 
     override fun close() {
-        if (!closed.compareAndSet(false, true)) return
+        synchronized(bluetoothControlLock) {
+            if (!closed.compareAndSet(false, true)) return
+        }
+        // Stop accept and passive incoming waits before joining the bootstrap worker.
+        bluetoothServices.forEach { runCatching { it.close() } }
+        bluetoothServices.clear()
+        bluetoothSocketOwner.close()
         // The bootstrap and its preparation tracks keep building and using the resources
         // below while they run. Give them first crack at stopping: interrupt so the
         // blocking stages (su round-trips, Bluetooth connects, latch waits) unwind
@@ -983,11 +1305,15 @@ class LegacyWirelessController(
         // the interrupt flag and keeps waiting), so close the session and stream to break
         // that recv and free the RFCOMM channel before the joins below.
         closeRfcomm()
+        tunnelStreams.forEach { runCatching { it.close() } }
         bootstrapThread?.let { joinBounded(it, BOOTSTRAP_EXIT_WAIT_MS) }
         trackThreads.forEach { joinBounded(it, TRACK_EXIT_WAIT_MS) }
-        // Covers the bootstrap that raced the first call and published its stream only after
-        // it: a second close registers the fresh socket and collapses the 60s recv wait.
+        bluetoothAcceptThreads.forEach { joinBounded(it, TRACK_EXIT_WAIT_MS) }
+        bluetoothAcceptThreads.clear()
+        // Defensive cleanup after the worker exits; all new publications check closed under
+        // bluetoothControlLock, including the connecting socket before it has a stream.
         closeRfcomm()
+        tunnelStreams.clear()
         // Graceful goodbye first: tell the iPhone (changeModes borrow + local stream teardown)
         // that this CarPlay session is ending before the RTSP socket is closed abruptly. This
         // lets it stop the screen stream itself and exit its CarPlay state machine cleanly, so it
@@ -1018,8 +1344,16 @@ class LegacyWirelessController(
      * published stream. Both are safe to call from any thread.
      */
     private fun closeRfcomm() {
-        runCatching { rfcommSession?.close() }
-        runCatching { rfcommStream?.close() }
+        val (session, stream, connecting) = synchronized(bluetoothControlLock) {
+            Triple(rfcommSession, rfcommStream, connectingRfcommSocket).also {
+                rfcommSession = null
+                rfcommStream = null
+                connectingRfcommSocket = null
+            }
+        }
+        runCatching { session?.close() }
+        runCatching { stream?.close() }
+        runCatching { connecting?.close() }
     }
 
     /** Waits for [thread] to exit, restoring this thread's interrupt flag if the wait is cut short. */

@@ -14,6 +14,10 @@ import kotlin.math.min
 class Iap2WirelessIdentification(
     val bluetoothMac: String,
     val ssid: String,
+    /** Retains historical transport extensions by default; legacy only implements standard fields. */
+    val includeExtendedTransportParameters: Boolean = true,
+    /** Historical connection messages; modern-only identification falls back if 0x4300/0x4301 is rejected. */
+    val includeLegacyConnectionMessages: Boolean = true,
 ) {
     private val macBytes: ByteArray
 
@@ -220,7 +224,7 @@ class Iap2IdentificationClient(private val session: Iap2Session) {
                     IDENTIFICATION_REJECTED -> {
                         val rejection = identificationRejection(frame)
                         if (omitted != null) throw rejection
-                        omitted = rejection.omittableMessages() ?: throw rejection
+                        omitted = wirelessConnectionOmissions(config, rejection.omittableMessages() ?: throw rejection)
                         onProgress("iap2 identification retry without unsupported messages ${omitted.sorted().hexadecimalIds()}")
                         send(identificationInformation(config, omitted), remainingMillis(deadlineNanos))
                     }
@@ -298,9 +302,22 @@ class Iap2IdentificationClient(private val session: Iap2Session) {
             return ids
         }
 
-        /** Builds the smallest honest LIVI-compatible wired or wireless IdentificationInformation. */
+        private fun wirelessConnectionOmissions(config: Iap2IdentificationConfig, omitted: Set<Int>): Set<Int> =
+            if (config.wireless?.includeLegacyConnectionMessages == false &&
+                (CARPLAY_AVAILABILITY in omitted || CARPLAY_START_SESSION in omitted)
+            ) {
+                // R9 section 4.2 replaces the modern pair together when an older device rejects it.
+                omitted + CARPLAY_AVAILABILITY + CARPLAY_START_SESSION
+            } else omitted
+
+        /** Builds wired or wireless IdentificationInformation with the requested connection messages. */
         fun identificationInformation(config: Iap2IdentificationConfig, omitted: Set<Int> = emptySet()): Iap2Frame {
             val wireless = config.wireless
+            val omittedMessages = wirelessConnectionOmissions(config, omitted)
+            val includeLegacyWirelessMessages = wireless != null && (
+                wireless.includeLegacyConnectionMessages || CARPLAY_AVAILABILITY in omittedMessages ||
+                    CARPLAY_START_SESSION in omittedMessages
+                )
             var sentMessages = if (config.locationInformationEnabled) {
                 MESSAGES_SENT_BY_ACCESSORY + LOCATION_INFORMATION
             } else {
@@ -318,6 +335,13 @@ class Iap2IdentificationClient(private val session: Iap2Session) {
                     Iap2VehicleStatus.STOP_VEHICLE_STATUS_UPDATES,
                 )
             }
+            if (wireless != null) {
+                sentMessages = sentMessages.filterNot { it == POWER_SOURCE_UPDATE }.toIntArray()
+                if (includeLegacyWirelessMessages) {
+                    sentMessages += ACCESSORY_WIFI_CONFIGURATION_INFORMATION
+                    receivedMessages += WIRELESS_PHONE_MESSAGES
+                }
+            }
             return Iap2Messages.build(Iap2Endpoints.IDENTIFICATION_INFORMATION) {
                 string(0, config.name)
                 string(1, config.modelIdentifier)
@@ -327,20 +351,11 @@ class Iap2IdentificationClient(private val session: Iap2Session) {
                 string(5, config.hardwareVersion)
                 u16List(
                     6,
-                    if (wireless == null) {
-                        sentMessages.asIterable()
-                    } else {
-                        sentMessages.filterNot { it == POWER_SOURCE_UPDATE }.toIntArray().asIterable() +
-                            ACCESSORY_WIFI_CONFIGURATION_INFORMATION
-                    }.filterNot { it in omitted },
+                    sentMessages.asIterable().filterNot { it in omittedMessages },
                 )
                 u16List(
                     7,
-                    if (wireless == null) {
-                        receivedMessages.asIterable()
-                    } else {
-                        receivedMessages.asIterable() + WIRELESS_PHONE_MESSAGES.asIterable()
-                    }.filterNot { it in omitted },
+                    receivedMessages.asIterable().filterNot { it in omittedMessages },
                 )
                 u8(8, if (wireless == null) 2 else 0)
                 u16(9, 20)
@@ -365,16 +380,18 @@ class Iap2IdentificationClient(private val session: Iap2Session) {
                         string(1, "blue")
                         void(2)
                         bytes(3, wireless.bluetoothMacBytes())
-                        string(4, "blue")
-                        void(5)
+                        if (wireless.includeExtendedTransportParameters) {
+                            string(4, "blue")
+                            void(5)
+                        }
                     }
                     group(24) {
                         u16(0, 1)
                         string(1, wireless.ssid)
                         void(2)
-                        u16(3, 1)
+                        if (wireless.includeExtendedTransportParameters) u16(3, 1)
                         void(4)
-                        void(5)
+                        if (wireless.includeExtendedTransportParameters) void(5)
                     }
                 }
                 if (config.vehicleStatusEnabled) electricVehicleComponents(config.manufacturer, config.chargingConnectors)

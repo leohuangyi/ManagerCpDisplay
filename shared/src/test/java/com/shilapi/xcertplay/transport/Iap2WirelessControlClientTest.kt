@@ -111,6 +111,149 @@ class Iap2WirelessControlClientTest {
     }
 
     @Test
+    fun standardWirelessIdentificationNarrowsBothTransportsAndKeepsTheRawMac() {
+        val defaultConfig = Iap2IdentificationConfig(
+            name = "CarPlay",
+            modelIdentifier = "CarPlay",
+            manufacturer = "test",
+            serialNumber = "test",
+            firmwareVersion = "1.0",
+            hardwareVersion = "1.0",
+            wireless = Iap2WirelessIdentification("AA:BB:CC:DD:EE:FF", "test"),
+        )
+        val standardConfig = defaultConfig.copy(
+            wireless = Iap2WirelessIdentification(
+                "AA:BB:CC:DD:EE:FF", "test", includeExtendedTransportParameters = false,
+            ),
+        )
+        val defaultParameters = parameters(Iap2IdentificationClient.identificationInformation(defaultConfig).payload)
+        val standardParameters = parameters(Iap2IdentificationClient.identificationInformation(standardConfig).payload)
+        val rawMac = byteArrayOf(0xaa.toByte(), 0xbb.toByte(), 0xcc.toByte(), 0xdd.toByte(), 0xee.toByte(), 0xff.toByte())
+
+        for ((groupId, standardIds) in listOf(17 to listOf(0, 1, 2, 3), 24 to listOf(0, 1, 2, 4))) {
+            val extended = parameters(defaultParameters.single { it.id == groupId }.payload)
+            val standard = parameters(standardParameters.single { it.id == groupId }.payload)
+            assertEquals(listOf(0, 1, 2, 3, 4, 5), extended.map { it.id })
+            assertEquals(standardIds, standard.map { it.id })
+            for (field in standard) {
+                assertArrayEquals(extended.single { it.id == field.id }.payload, field.payload)
+            }
+            if (groupId == 17) {
+                assertArrayEquals(rawMac, extended.single { it.id == 3 }.payload)
+                assertArrayEquals(rawMac, standard.single { it.id == 3 }.payload)
+            } else {
+                assertArrayEquals(byteArrayOf(0, 1), standard.single { it.id == 0 }.payload)
+                assertEquals("test\u0000", standard.single { it.id == 1 }.payload.decodeToString())
+                assertArrayEquals(byteArrayOf(), standard.single { it.id == 4 }.payload)
+            }
+        }
+    }
+
+    @Test
+    fun modernConnectionIdentificationOmitsOnlyTheFourLegacyMessages() {
+        val modernConfig = modernConnectionConfig()
+        val defaultConfig = modernConfig.copy(
+            wireless = Iap2WirelessIdentification("AA:BB:CC:DD:EE:FF", "test", includeExtendedTransportParameters = false),
+        )
+        val explicitLegacyConfig = modernConfig.copy(
+            wireless = Iap2WirelessIdentification(
+                "AA:BB:CC:DD:EE:FF", "test", includeExtendedTransportParameters = false,
+                includeLegacyConnectionMessages = true,
+            ),
+        )
+        val defaultFrame = Iap2IdentificationClient.identificationInformation(defaultConfig)
+        assertArrayEquals(defaultFrame.encodedFrame(),
+            Iap2IdentificationClient.identificationInformation(explicitLegacyConfig).encodedFrame())
+
+        val defaultParameters = parameters(defaultFrame.payload)
+        val modern = parameters(Iap2IdentificationClient.identificationInformation(modernConfig).payload)
+        val sent = u16Values(modern.single { it.id == 6 }.payload)
+        val received = u16Values(modern.single { it.id == 7 }.payload)
+        assertEquals(u16Values(defaultParameters.single { it.id == 6 }.payload).filterNot { it == 0x5703 }, sent)
+        assertEquals(u16Values(defaultParameters.single { it.id == 7 }.payload)
+            .filterNot { it in setOf(0x5702, 0x4e0d, 0x4e0e) }, received)
+        assertTrue(0x4301 in sent)
+        assertTrue(0x4300 in received)
+        for (field in defaultParameters.filterNot { it.id == 6 || it.id == 7 }) {
+            assertArrayEquals(field.payload, modern.single { it.id == field.id }.payload)
+        }
+    }
+
+    @Test
+    fun eitherModernConnectionMessageRejectionRestoresLegacyAndSurvivesIdentificationRestart() {
+        for (rejectedModern in listOf(setOf(0x4300), setOf(0x4301), setOf(0x4300, 0x4301))) {
+            val config = modernConnectionConfig()
+            val rejection = rejectedIdentification(
+                sentIds = listOf(0x4157) + rejectedModern.filter { it == 0x4301 },
+                receivedIds = rejectedModern.filter { it == 0x4300 },
+            )
+            val frames = exchangeIdentification(config, listOf(
+                identificationStart(), rejection, identificationStart(), identificationAccepted(),
+            ))
+            assertEquals(3, frames.size)
+            assertArrayEquals(frames[1].encodedFrame(), frames[2].encodedFrame())
+            val first = parameters(frames[0].payload)
+            val fallback = parameters(frames[1].payload)
+            val sent = u16Values(fallback.single { it.id == 6 }.payload)
+            val received = u16Values(fallback.single { it.id == 7 }.payload)
+            assertFalse(0x4301 in sent)
+            assertFalse(0x4300 in received)
+            assertTrue(0x5703 in sent)
+            assertTrue(received.containsAll(listOf(0x5702, 0x4e0d, 0x4e0e)))
+            assertFalse(0x4157 in sent) // Other rejected messages stay omitted.
+            assertTrue(0xaa03 in sent)
+            assertTrue(0xaa05 in received)
+            for (group in listOf(17, 24)) {
+                assertArrayEquals(first.single { it.id == group }.payload, fallback.single { it.id == group }.payload)
+            }
+        }
+    }
+
+    @Test
+    fun unrelatedMessageRejectionDoesNotEnableLegacyConnectionMessages() {
+        val frames = exchangeIdentification(modernConnectionConfig(), listOf(
+            identificationStart(), rejectedIdentification(sentIds = listOf(0x4157)), identificationAccepted(),
+        ))
+        assertEquals(2, frames.size)
+        val retried = parameters(frames[1].payload)
+        val sent = u16Values(retried.single { it.id == 6 }.payload)
+        val received = u16Values(retried.single { it.id == 7 }.payload)
+        assertFalse(0x4157 in sent)
+        assertFalse(0x5703 in sent)
+        assertFalse(received.any { it in setOf(0x5702, 0x4e0d, 0x4e0e) })
+        assertTrue(0x4301 in sent)
+        assertTrue(0x4300 in received)
+    }
+
+    @Test
+    fun modernConnectionFallbackStillAllowsOnlyOneRetry() {
+        val rejection = rejectedIdentification(sentIds = listOf(0x4301))
+        val sent = mutableListOf<Iap2Frame>()
+        assertThrows(Iap2IdentificationException.Rejected::class.java) {
+            exchangeIdentification(modernConnectionConfig(), listOf(identificationStart(), rejection, rejection), sent)
+        }
+        assertEquals(2, sent.size)
+    }
+
+    @Test
+    fun modernConnectionFallbackDoesNotBypassMalformedIdentityOrAuthenticationRejections() {
+        val uncorrectable = listOf(
+            Iap2ParameterList.of(Iap2Parameter(6, byteArrayOf(0x43))).encode(),
+            Iap2ParameterList.of(Iap2Parameter(6, byteArrayOf(0x43, 0x01)), Iap2Parameter(16, byteArrayOf())).encode(),
+            Iap2ParameterList.of(Iap2Parameter(6, byteArrayOf(0x43, 0x01, 0xaa.toByte(), 0x01))).encode(),
+        )
+        for (payload in uncorrectable) {
+            val sent = mutableListOf<Iap2Frame>()
+            assertThrows(Iap2IdentificationException.Rejected::class.java) {
+                exchangeIdentification(modernConnectionConfig(), listOf(
+                    identificationStart(), Iap2Frame(Iap2IdentificationClient.IDENTIFICATION_REJECTED, payload),
+                ), sent)
+            }
+            assertEquals(1, sent.size)
+        }
+    }
+
+    @Test
     fun wirelessCarPlayUpdateReadsBooleanAvailability() {
         val frame = Iap2Frame(
             0x4e0d,
@@ -191,6 +334,39 @@ class Iap2WirelessControlClientTest {
         sourceVersion = "1.0",
         accessPointBssid = ap,
     )
+
+    private fun modernConnectionConfig() = Iap2IdentificationConfig(
+        name = "CarPlay", modelIdentifier = "CarPlay", manufacturer = "test", serialNumber = "test",
+        firmwareVersion = "1.0", hardwareVersion = "1.0",
+        wireless = Iap2WirelessIdentification(
+            "AA:BB:CC:DD:EE:FF", "test", includeExtendedTransportParameters = false,
+            includeLegacyConnectionMessages = false,
+        ),
+    )
+
+    private fun exchangeIdentification(
+        config: Iap2IdentificationConfig,
+        replies: List<Iap2Frame>,
+        sent: MutableList<Iap2Frame> = mutableListOf(),
+    ): List<Iap2Frame> {
+        val queue = ArrayDeque(replies)
+        Iap2IdentificationClient.exchange(
+            awaitReady = { true }, recv = { queue.removeFirstOrNull() }, send = { frame, _ -> sent += frame },
+            config = config, timeoutMillis = 1_000, onProgress = {},
+        )
+        return sent
+    }
+
+    private fun identificationStart() = Iap2Frame(Iap2IdentificationClient.START_IDENTIFICATION, byteArrayOf())
+    private fun identificationAccepted() = Iap2Frame(Iap2IdentificationClient.IDENTIFICATION_ACCEPTED, byteArrayOf())
+
+    private fun rejectedIdentification(sentIds: List<Int> = emptyList(), receivedIds: List<Int> = emptyList()): Iap2Frame {
+        fun payload(ids: List<Int>) = ids.flatMap { listOf((it shr 8).toByte(), it.toByte()) }.toByteArray()
+        val fields = mutableListOf<Iap2Parameter>()
+        if (sentIds.isNotEmpty()) fields += Iap2Parameter(6, payload(sentIds))
+        if (receivedIds.isNotEmpty()) fields += Iap2Parameter(7, payload(receivedIds))
+        return Iap2Frame(Iap2IdentificationClient.IDENTIFICATION_REJECTED, Iap2ParameterList.of(*fields.toTypedArray()).encode())
+    }
 
     private fun u16Values(bytes: ByteArray): List<Int> =
         List(bytes.size / 2) { index ->

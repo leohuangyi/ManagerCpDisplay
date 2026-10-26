@@ -31,15 +31,26 @@ class BluetoothRfcommStreamException internal constructor(
  */
 class BluetoothRfcommDuplexStream internal constructor(
     private val socket: BluetoothRfcommSocketAccess,
-    private val onDiagnostic: (String) -> Unit = {},
+    private val onDiagnostic: (String) -> Unit,
+    private val closeUnderlyingSocket: () -> Unit,
 ) : BlockingDuplexByteStream {
+    internal constructor(socket: BluetoothRfcommSocketAccess, onDiagnostic: (String) -> Unit = {}) : this(
+        socket, onDiagnostic, socket::close,
+    )
+
     constructor(socket: BluetoothSocket, onDiagnostic: (String) -> Unit = {}) : this(
+        socket, onDiagnostic, { socket.close() },
+    )
+
+    /** Shares a close gate with the owner that may still be cancelling the Bluetooth connect. */
+    constructor(socket: BluetoothSocket, onDiagnostic: (String) -> Unit, closeSocket: () -> Unit) : this(
         object : BluetoothRfcommSocketAccess {
             override fun inputStream(): InputStream? = socket.inputStream
             override fun outputStream(): OutputStream? = socket.outputStream
             override fun close() = socket.close()
         },
         onDiagnostic,
+        closeSocket,
     )
 
     private val lock = Object()
@@ -303,7 +314,7 @@ class BluetoothRfcommDuplexStream internal constructor(
             socketCloseStarted = true
         }
         return try {
-            socket.close()
+            closeUnderlyingSocket()
             null
         } catch (failure: Throwable) {
             if (failure is Error) throw failure

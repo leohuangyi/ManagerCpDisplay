@@ -9,11 +9,55 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.*
 import org.junit.Test
 
 class BluetoothRfcommDuplexStreamTest {
+    @Test fun ownerCancellationAndStreamCloseShareTheSuppliedSocketCloseGate() {
+        val socket = FakeSocket(BlockingInput())
+        val gate = AtomicBoolean(false)
+        val closeOnce = { if (gate.compareAndSet(false, true)) socket.close() }
+        val owner = BluetoothControlSocketOwner<FakeSocket> { closeOnce() }
+        owner.selectPeer("phone")
+        assertTrue(owner.beginOutgoing("phone", socket))
+        assertTrue(owner.outgoingConnected(socket))
+        val stream = BluetoothRfcommDuplexStream(socket, {}, closeOnce)
+        val start = CountDownLatch(1)
+        val canceller = Thread { start.await(); owner.close() }
+        val closer = Thread { start.await(); stream.close() }
+        try {
+            canceller.start()
+            closer.start()
+            start.countDown()
+            canceller.join(2_000)
+            closer.join(2_000)
+            assertFalse(canceller.isAlive)
+            assertFalse(closer.isAlive)
+            assertEquals(1, socket.closes.get())
+        } finally {
+            start.countDown()
+            stream.close()
+            owner.close()
+            canceller.join(2_000)
+            closer.join(2_000)
+        }
+    }
+
+    @Test fun constructionFailureUsesTheOwnersCloseGate() {
+        val socket = FakeSocket(null)
+        val gate = AtomicBoolean(false)
+        val closeOnce = { if (gate.compareAndSet(false, true)) socket.close() }
+        val owner = BluetoothControlSocketOwner<FakeSocket> { closeOnce() }
+        owner.selectPeer("phone")
+        assertTrue(owner.beginOutgoing("phone", socket))
+        assertTrue(owner.outgoingConnected(socket))
+        expectFailure { BluetoothRfcommDuplexStream(socket, {}, closeOnce) }
+        owner.close()
+        assertEquals(1, socket.closes.get())
+    }
+
     @Test fun bytesReceivedStaysZeroUntilThePeerDeliversSomething() {
         val silent = BluetoothRfcommDuplexStream(FakeSocket(BlockingInput()))
         assertNull(silent.recv(16, 50))
@@ -70,7 +114,11 @@ class BluetoothRfcommDuplexStreamTest {
         val original = IOException("private Bluetooth address")
         val lines = CopyOnWriteArrayList<String>()
         val socket = FakeSocket(FailingInput(original))
-        val stream = BluetoothRfcommDuplexStream(socket, lines::add)
+        val closeCallbacks = AtomicInteger()
+        val stream = BluetoothRfcommDuplexStream(socket, lines::add) {
+            closeCallbacks.incrementAndGet()
+            socket.close()
+        }
 
         val failure = expectFailure { stream.recv(32, 2_000) }
         stream.close()
@@ -78,6 +126,7 @@ class BluetoothRfcommDuplexStreamTest {
         assertSame(original, failure.cause)
         assertEquals(BluetoothRfcommStreamException.Operation.READ, failure.operation)
         assertEquals(1, socket.closes.get())
+        assertEquals(1, closeCallbacks.get())
         assertTrue(lines.any { it.contains("reader result=FAILED beforeFirstByte=true readCalls=1 receivedBytes=0") })
         assertTrue(lines.any { it.contains("operation=READ reason=READ_FAILED") })
         assertFalse(lines.joinToString().contains("private"))

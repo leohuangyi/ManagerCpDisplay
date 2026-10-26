@@ -9,6 +9,7 @@ import android.os.Looper
 import java.io.Closeable
 import java.io.File
 import java.net.Inet4Address
+import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.NetworkInterface
 import java.util.concurrent.CountDownLatch
@@ -124,94 +125,156 @@ class LegacyNetwork(
     // no tethering screen. The only working soft-AP is the native three-step sequence
     // (hostapd -> static IP -> dnsmasq), so this mode drives it directly as root.
     private fun prepareAuto(): Endpoint {
-        // Fast path: this mode's hotspot is already up, keep the connection intact.
-        // InetAddress.toString() prefixes a slash ("/192.168.43.1"), compare hostAddress.
-        // The address alone is not enough: the kernel keeps the static address after
-        // `ifconfig down`, so a stopped hotspot would still match. Neither is dnsmasq
-        // alone: the firmware runs its own dnsmasq for the car's hotspot, and a leftover
-        // pid file can pass its check while our hostapd is long dead (the phone then
-        // joins the car hotspot and video never arrives). Require both to be alive.
-        val existing = scanEndpoint(listOf("wlan", "ap"))
-        if (existing != null && existing.second.hostAddress.startsWith("192.168.43.") &&
-            isDnsmasqAlive() && isHostapdAlive()
-        ) {
+        // The helper owns discovery and process identities. Do not infer ownership from
+        // another hotspot's hostapd/dnsmasq, a stale address, or an interface name prefix.
+        val (prepRc, prepOut) = runOp(OP_HOTSPOT_PREP, timeoutSeconds = 12)
+        check(prepRc == 0) { "Hotspot preparation failed rc=$prepRc: ${prepOut.take(200)}" }
+        val prepared = parseHotspotMetadata(prepOut)
+        if (prepared.ownedActive) {
+            val existing = findEndpoint(emptyList(), prepared.iface, prepared.address)
+                ?: throw IllegalStateException("Owned hotspot interface/address unavailable")
             hotspotStartedByUs = false
             raiseRmemMax()
-            val (ssid, password, channel) = hotspotProfile()
+            cacheHotspotProfile(prepared)
             log("Network mode=$networkMode interface=${existing.first.name} already up")
-            return Endpoint(ssid, password, channel, existing.first, existing.second)
+            return Endpoint(
+                prepared.ssid, prepared.password, prepared.channel, existing.first, existing.second,
+                hotspotAddresses(existing.first, existing.second),
+            )
         }
 
-        // 原车 MCS 自带无线 CarPlay 的蓝牙 iAP2（jiap_version_finalize tr_type=2 / mc_iap2_attach）
-        // 会抢占 iPhone 会话：DiPlay 的 0x4301 发出去后 iPhone 仍绑在原车 MCS，不会加入
-        // DiPlay-Legacy 热点。拉起热点前先 mcreset（kill mcservice）把蓝牙 iAP2 让给 DiPlay。
+        // Preserve this app's saved credentials when upgrading the helper. The runtime
+        // validates them and keeps its own copy after a successful start.
+        val requested = cachedHotspotProfile(prepared)
+        // This is optional OEM recovery: an absent mcreset must not prevent an otherwise
+        // capable head unit from starting its AP. WIAP policy is managed by the host.
         val (mcRc, mcOut) = runOp(OP_MC_RESET, timeoutSeconds = 15)
         log("McReset before hotspot rc=$mcRc out=${mcOut.trim().take(200)}")
 
-        // Heavy path: one su call covers the root check, the firmware's hotspot profile and
-        // the rmem_max raise. Three separate su spawns cost about a second each on this unit.
-        val (prepRc, prepOut) = runOp(OP_HOTSPOT_PREP, timeoutSeconds = 8)
-        if (prepRc != 0 || !prepOut.contains("uid=0")) {
-            throw IllegalStateException("H a n r请检查权限是否开启")
-        }
-        val (ssid, password, channel) = parseAndCacheHotspotProfile(prepOut)
-
-        val (upRc, upOut) = runOp(OP_HOTSPOT_UP, "$ssid\n$password\n$channel")
-        log("Hotspot up rc=$upRc out=${upOut.trim().take(300)}")
-        check(upRc == 0) { "Hotspot startup failed rc=$upRc" }
-        // The script's exit code only reflects dnsmasq, its last command: hostapd can
-        // silently fail to start (unreadable conf after its privilege drop) while the
-        // rest succeeds, which ends as "Connected" without any video. Fail loudly.
-        check(isHostapdAlive()) { "hostapd did not start, see logcat tag hostapd" }
+        val (upRc, upOut) = runOp(
+            OP_HOTSPOT_UP, "${requested.ssid}\n${requested.password}\n${requested.channel}", timeoutSeconds = 30,
+        )
+        // Successful metadata includes credentials, so keep it out of diagnostics.
+        log("Hotspot up rc=$upRc")
+        check(upRc == 0) { "Hotspot startup failed rc=$upRc: ${upOut.take(200)}" }
+        val active = parseHotspotMetadata(upOut)
+        check(active.ownedActive) { "Helper did not confirm its owned hotspot is ready" }
         hotspotStartedByUs = true
 
-        val (iface, address) = findEndpoint(listOf("wlan", "ap"))
+        val (iface, address) = findEndpoint(emptyList(), active.iface, active.address)
             ?: throw IllegalStateException("Network IPv4 address unavailable")
+        cacheHotspotProfile(active)
         log("Network mode=$networkMode interface=${iface.name} ready=true")
-        return Endpoint(ssid, password, channel, iface, address)
+        return Endpoint(active.ssid, active.password, active.channel, iface, address, hotspotAddresses(iface, address))
     }
 
-    /**
-     * The (ssid, passphrase, channel) the broadcast AP uses. The heavy path reads them from
-     * the firmware's hostapd.conf over su and caches the triple, so a later fast path can
-     * rebuild the endpoint without paying another su spawn. A cold cache falls back to one
-     * su read (or the known defaults when root is unavailable).
-     */
-    private fun hotspotProfile(): Triple<String, String, Int> {
+    /** IPv6 DAD can finish after ifconfig returns; keep IPv4 working on IPv4-only firmware. */
+    private fun hotspotAddresses(iface: NetworkInterface, ipv4: Inet4Address): List<InetAddress> {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+        while (!stopped()) {
+            // NetworkInterface is a snapshot. Re-read the same interface while DAD settles,
+            // preserving its scope for the IPv6 listener (0x4301 strips the zone separately).
+            val ipv6 = runCatching {
+                val current = NetworkInterface.getByName(iface.name) ?: return@runCatching emptyList()
+                if (!current.isUp) return@runCatching emptyList()
+                val ready = readyIpv6Addresses(iface.name) ?: return@runCatching emptyList()
+                val addresses = current.inetAddresses ?: return@runCatching emptyList()
+                val usable = ArrayList<Inet6Address>()
+                while (addresses.hasMoreElements()) {
+                    val address = addresses.nextElement()
+                    if (address !is Inet6Address || !address.isLinkLocalAddress ||
+                        address.isAnyLocalAddress || address.isLoopbackAddress || address.isMulticastAddress
+                    ) continue
+                    val hex = address.address.joinToString("") {
+                        (it.toInt() and 0xff).toString(16).padStart(2, '0')
+                    }
+                    if (hex !in ready) continue
+                    val scoped = Inet6Address.getByAddress(null, address.address, current)
+                    if (scoped.scopeId > 0) usable += scoped
+                }
+                usable
+            }.getOrDefault(emptyList())
+            if (stopped()) throw InterruptedException("Hotspot address preparation stopped")
+            if (ipv6.isNotEmpty()) {
+                return (ipv6 + ipv4).also { addresses ->
+                    log("Hotspot interface=${iface.name} addresses=${addresses.joinToString { it.hostAddress }}")
+                }
+            }
+            val remaining = deadline - System.nanoTime()
+            if (remaining <= 0L) break
+            try {
+                Thread.sleep(minOf(100L, maxOf(1L, TimeUnit.NANOSECONDS.toMillis(remaining))))
+            } catch (error: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw error
+            }
+        }
+        if (stopped()) throw InterruptedException("Hotspot address preparation stopped")
+        log("Hotspot interface=${iface.name} IPv6 link-local unavailable; addresses=${ipv4.hostAddress}")
+        return listOf(ipv4)
+    }
+
+    /** Android's NetworkInterface API omits Linux DAD flags; never advertise a tentative address. */
+    private fun readyIpv6Addresses(ifaceName: String): Set<String>? = runCatching {
+        File("/proc/net/if_inet6").readLines().mapNotNull { line ->
+            val fields = line.trim().split(Regex("\\s+"))
+            if (fields.size < 6 || fields[5] != ifaceName) return@mapNotNull null
+            val flags = fields[4].toIntOrNull(16) ?: return@mapNotNull null
+            // IFA_F_DADFAILED / TENTATIVE: the address has not completed duplicate detection.
+            if (flags and (0x08 or 0x40) != 0) return@mapNotNull null
+            fields[0].lowercase()
+        }.toSet()
+    }.getOrNull()
+
+    private data class HotspotMetadata(
+        val ssid: String,
+        val password: String,
+        val channel: Int,
+        val iface: String,
+        val address: String,
+        val ownedActive: Boolean,
+    )
+
+    /** A new helper must provide a concrete interface; old global-process guesses are unsafe. */
+    private fun parseHotspotMetadata(out: String): HotspotMetadata {
+        val values = out.lineSequence().mapNotNull { line ->
+            val eq = line.indexOf('=')
+            if (eq <= 0) null else line.substring(0, eq).trim() to line.substring(eq + 1).removeSuffix("\r")
+        }.toMap()
+        val iface = values["diplay_iface"]
+        check(iface != null && iface.matches(Regex("[A-Za-z0-9][A-Za-z0-9_.-]{0,31}"))) {
+            "Assistant hotspot metadata unavailable; update the assistant"
+        }
+        val address = values["diplay_address"]
+        check(address != null && address.split('.').let { octets ->
+            octets.size == 4 && octets.all { octet -> octet.toIntOrNull()?.let { it in 0..255 } == true }
+        }) { "Assistant hotspot IPv4 address invalid" }
+        val ssid = values["ssid"]
+        val password = values["wpa_passphrase"]
+        val channel = values["channel"]?.toIntOrNull()
+        check(!ssid.isNullOrEmpty() && !password.isNullOrEmpty() && channel != null && channel in 1..13) {
+            "Assistant hotspot profile unavailable"
+        }
+        return HotspotMetadata(ssid, password, channel, iface, address, values["diplay_owned_active"] == "1")
+    }
+
+    private fun cachedHotspotProfile(fallback: HotspotMetadata): HotspotMetadata {
         val prefs = context.getSharedPreferences("legacy-network", Context.MODE_PRIVATE)
         val cachedSsid = prefs.getString("hotspotSsid", null)
         val cachedPassword = prefs.getString("hotspotPassword", null)
         val cachedChannel = prefs.getInt("hotspotChannel", -1)
-        if (cachedSsid != null && cachedPassword != null && cachedChannel > 0) {
-            return Triple(cachedSsid, cachedPassword, cachedChannel)
+        if (!cachedSsid.isNullOrEmpty() && !cachedPassword.isNullOrEmpty() && cachedChannel in 1..13) {
+            return fallback.copy(ssid = cachedSsid, password = cachedPassword, channel = cachedChannel)
         }
-        val (rc, out) = runOp(OP_HOTSPOT_PREP, timeoutSeconds = 8)
-        if (rc != 0) return Triple("DiPlay-Legacy", "diplay1234", 6)
-        return parseAndCacheHotspotProfile(out)
+        return fallback
     }
 
-    /** Parses (ssid, passphrase, channel) from the combined su prep output, falling back to the known defaults. */
-    private fun parseAndCacheHotspotProfile(out: String): Triple<String, String, Int> {
-        var ssid = "DiPlay-Legacy"
-        var password = "diplay1234"
-        var channel = 6
-        for (line in out.lines()) {
-            val eq = line.indexOf('=')
-            if (eq <= 0) continue
-            val key = line.substring(0, eq).trim()
-            val value = line.substring(eq + 1).trim()
-            when (key) {
-                "ssid" -> ssid = value
-                "wpa_passphrase" -> password = value
-                "channel" -> channel = value.toIntOrNull() ?: channel
-            }
-        }
+    private fun cacheHotspotProfile(profile: HotspotMetadata) {
         context.getSharedPreferences("legacy-network", Context.MODE_PRIVATE).edit()
-            .putString("hotspotSsid", ssid)
-            .putString("hotspotPassword", password)
-            .putInt("hotspotChannel", channel)
+            .putString("hotspotSsid", profile.ssid)
+            .putString("hotspotPassword", profile.password)
+            .putInt("hotspotChannel", profile.channel)
             .commit()
-        return Triple(ssid, password, channel)
     }
 
     /**
@@ -243,59 +306,46 @@ class LegacyNetwork(
 
     // --- Shared helpers --------------------------------------------------------------------
 
-    private fun findEndpoint(prefixes: List<String>): Pair<NetworkInterface, Inet4Address>? {
+    private fun findEndpoint(
+        prefixes: List<String>,
+        exactInterface: String? = null,
+        exactAddress: String? = null,
+    ): Pair<NetworkInterface, Inet4Address>? {
         val deadline = System.nanoTime() + 10_000_000_000L
         while (!stopped() && System.nanoTime() < deadline) {
-            scanEndpoint(prefixes)?.let { return it }
+            scanEndpoint(prefixes, exactInterface, exactAddress)?.let { return it }
             Thread.sleep(250)
         }
         return null
     }
 
-    private fun scanEndpoint(prefixes: List<String>): Pair<NetworkInterface, Inet4Address>? {
+    private fun scanEndpoint(
+        prefixes: List<String>,
+        exactInterface: String? = null,
+        exactAddress: String? = null,
+    ): Pair<NetworkInterface, Inet4Address>? {
         val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
         val candidates = ArrayList<NetworkInterface>()
         while (interfaces.hasMoreElements()) {
             val iface = interfaces.nextElement()
-            if (prefixes.any { iface.name.startsWith(it) }) candidates.add(iface)
+            if (exactInterface != null) {
+                if (iface.name == exactInterface) candidates.add(iface)
+            } else if (prefixes.any { iface.name.startsWith(it) }) candidates.add(iface)
         }
         for (iface in candidates) {
+            if (!iface.isUp) continue
             val addresses = iface.inetAddresses ?: continue
             while (addresses.hasMoreElements()) {
                 val address = addresses.nextElement()
-                if (address is Inet4Address && !address.isLoopbackAddress && !address.isAnyLocalAddress) {
+                if (address is Inet4Address && !address.isLoopbackAddress && !address.isAnyLocalAddress &&
+                    (exactAddress == null || address.hostAddress == exactAddress)
+                ) {
                     return iface to address
                 }
             }
         }
         return null
     }
-
-    /**
-     * True when the hotspot's dnsmasq is still alive: reads its pid file and verifies
-     * `/proc/<pid>/cmdline`. Only the fast path uses this, so a false negative just means
-     * the heavy path restarts the hotspot from scratch.
-     */
-    private fun isDnsmasqAlive(): Boolean = runCatching {
-        val pid = File("/data/local/tmp/dnsmasq.pid").readText().trim().toIntOrNull()
-            ?: return@runCatching false
-        File("/proc/$pid/cmdline").readText().contains("dnsmasq")
-    }.getOrDefault(false)
-
-    /**
-     * True when a hostapd process is running: scans /proc for a cmdline containing
-     * "hostapd". Used by the fast path and after a cold start, so a false negative just
-     * restarts the hotspot from scratch. Unlike the su scripts this scan runs in the app
-     * process, whose cmdline never contains "hostapd", so it cannot match itself.
-     */
-    private fun isHostapdAlive(): Boolean = runCatching {
-        val procs = File("/proc").listFiles() ?: return@runCatching false
-        procs.any { proc ->
-            proc.name.toIntOrNull() != null &&
-                runCatching { File(proc, "cmdline").readText() }
-                    .getOrDefault("").contains("hostapd")
-        }
-    }.getOrDefault(false)
 
     private fun currentApConfig(): WifiConfiguration? = runCatching {
         wifi.javaClass.getMethod("getWifiApConfiguration").invoke(wifi) as? WifiConfiguration
@@ -342,20 +392,14 @@ class LegacyNetwork(
 
     /**
      * Restores the head unit's client Wi-Fi after CarPlay ended and the app exits for good
-     * (final app exit, not an in-process wireless restart). Tears any leftover hostapd/dnsmasq
-     * hotspot down regardless of who started it — on the fast path the hotspot was reused, not
-     * started by us — and bounces the stack: the station side does not rescan wlan0 by itself
-     * after hostapd released it, so only a disable -> enable cycle makes the head unit rejoin
-     * its saved Wi-Fi networks. Runs over the same su broadcast channel as the boot path
-     * (LocalAdb -> assistant CpManager). The teardown is idempotent, so repeating it after
-     * [close]'s own teardown is harmless; the final `svc wifi enable` decides the exit code.
+     * (final app exit, not an in-process wireless restart). The helper also owns a hotspot
+     * reused on the fast path, and restores only the changes in its durable journal. OEM
+     * hotspots and a Wi-Fi station that was originally disabled are left alone.
      */
     fun restoreAfterCarPlay(): Boolean {
         val (rc, out) = runOp(OP_WIFI_RESTORE, timeoutSeconds = 25)
         log("Wifi restart rc=$rc out=${out.trim().take(300)}")
-        // 无论 Wi-Fi 是否还原成功，都再走原车 mcreset 重置媒体核心（stop jmcs -> stop mdnsd ->
-        // kill mcservice -> start mdnsd -> start jmcs），把 DiPlay 退出后残留的 iAP2/USB host
-        // 状态机拉回干净状态，使原车有线 CarPlay 重新可 claim。
+        // Optional firmware recovery: the helper calls only an existing OEM mcreset tool.
         val (mrc, mout) = runOp(OP_MC_RESET, timeoutSeconds = 15)
         log("Media core reset rc=$mrc out=${mout.trim().take(200)}")
         return rc == 0

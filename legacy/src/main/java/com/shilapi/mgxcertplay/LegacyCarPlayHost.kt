@@ -1,6 +1,7 @@
 package com.shilapi.mgxcertplay
 
 import android.content.Context
+import android.os.Build
 import android.util.Base64
 import android.util.Log
 import android.view.MotionEvent
@@ -82,8 +83,11 @@ object LegacyCarPlayHost {
                 modelIdentifier = "CarPlay",
                 manufacturer = "CarPlay",
                 serialNumber = identity.pairingId,
-                firmwareVersion = "0.21",
-                hardwareVersion = "iMX6",
+                firmwareVersion = runCatching {
+                    context.packageManager.getPackageInfo(context.packageName, 0).versionName
+                }.getOrNull()?.takeIf { it.isNotBlank() } ?: "DiPlay",
+                hardwareVersion = Build.HARDWARE.takeIf { it.isNotBlank() }
+                    ?: Build.DEVICE.takeIf { it.isNotBlank() } ?: "Android",
                 carPlayUsbInterfaceNumber = 3,
             ),
             label = "CarPlay",
