@@ -184,7 +184,9 @@ class LegacyWirelessController(
             sessions.remove(session)
             if (activeSession === session) activeSession = null
             log("AirPlay session ended")
-            onSessionEnded()
+            // Startup rollback and an explicit close can end a partially accepted
+            // session. They must finish cleanup before the host starts another link.
+            if (!closed.get()) onSessionEnded()
         }
 
         override fun onTransportError(message: String) {
@@ -310,6 +312,9 @@ class LegacyWirelessController(
         } catch (e: Throwable) {
             if (!closed.get()) {
                 Log.e(TAG, "bootstrap failed", e)
+                // Failed discovery can already own locks and partially prepared listeners.
+                // Roll them back now, even if the driver leaves the failure screen open.
+                runCatching { close() }.onFailure { Log.w(TAG, "bootstrap cleanup failed", it) }
                 failure("bootstrap", e)
             }
         }
@@ -475,6 +480,19 @@ class LegacyWirelessController(
             }
         }
 
+        val mcLock = wifi.createMulticastLock("legacy-carplay-mdns").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+        multicastLock = mcLock
+
+        // Open discovery before the TCP listeners: a busy UDP 5353 must not leave a
+        // half-started AirPlay server. Publish its services only after TCP is listening.
+        // JmDNS uses one wildcard UDP socket on this runtime, so keep one IPv4 registry;
+        // the AirPlay listeners and 0x4301 still provide IPv6 reachability.
+        val dns = JmDNS.create(readyEndpoint.address, "DiPlay-Legacy")
+        resources += dns
+
         // Bind one listener per advertised address family so the iPhone's AirPlay SYN on
         // 7100 is accepted whether it dials the IPv4 address or the scoped link-local IPv6.
         // Same LAN topology binds one listener per family; phone-hotspot mode does the same.
@@ -495,20 +513,6 @@ class LegacyWirelessController(
             }
         }
 
-        val mcLock = wifi.createMulticastLock("legacy-carplay-mdns").apply {
-            setReferenceCounted(false)
-            acquire()
-        }
-        multicastLock = mcLock
-
-        // A single JmDNS registry bound to the primary IPv4 address. jmdns 3.6.3 binds UDP 5353
-        // on the wildcard address (getMulticastBindAddress returns InetSocketAddress(MDNS_PORT)
-        // on non-Windows) and never sets SO_REUSEADDR, so a second per-family JmDNS instance
-        // fails with EADDRINUSE on this head unit. The dual-stack reachability over IPv6 comes
-        // from the dual 0x4301 addresses above plus the dual AirPlay listeners; mDNS discovery
-        // keeps the original single-registry form the hotspot path already used.
-        val dns = JmDNS.create(readyEndpoint.address, "DiPlay-Legacy")
-        resources += dns
         dns.registerService(
             ServiceInfo.create(
                 "_airplay._tcp.local.",
@@ -1299,8 +1303,9 @@ class LegacyWirelessController(
         // "start then exit" let the shutdown thread tear the network/hotspot down while
         // a preparation track was still using it, and the concurrent teardown crashed
         // the process natively (deadbaad invalid heap address in dlfree).
-        bootstrapThread?.interrupt()
-        trackThreads.forEach { it.interrupt() }
+        val closingThread = Thread.currentThread()
+        bootstrapThread?.takeUnless { it === closingThread }?.interrupt()
+        trackThreads.filter { it !== closingThread }.forEach { it.interrupt() }
         // The interrupt misses the bootstrap's blocking RFCOMM recv (the stream re-asserts
         // the interrupt flag and keeps waiting), so close the session and stream to break
         // that recv and free the RFCOMM channel before the joins below.
@@ -1358,6 +1363,7 @@ class LegacyWirelessController(
 
     /** Waits for [thread] to exit, restoring this thread's interrupt flag if the wait is cut short. */
     private fun joinBounded(thread: Thread, timeoutMillis: Long) {
+        if (thread === Thread.currentThread()) return
         try {
             thread.join(timeoutMillis)
         } catch (_: InterruptedException) {

@@ -131,14 +131,24 @@ class LegacyNetwork(
         check(prepRc == 0) { "Hotspot preparation failed rc=$prepRc: ${prepOut.take(200)}" }
         val prepared = parseHotspotMetadata(prepOut)
         if (prepared.ownedActive) {
-            val existing = findEndpoint(emptyList(), prepared.iface, prepared.address)
+            // AP processes and an address do not prove that discovery is ready. An OEM
+            // media reset can restart mdnsd while this owned AP survives, taking UDP 5353
+            // away from JmDNS. n1 preserves a healthy AP, or rebuilds our resources if
+            // OEM STA took the radio, without transferring teardown ownership here.
+            val (reuseRc, reuseOut) = runOp(
+                OP_HOTSPOT_UP, "${prepared.ssid}\n${prepared.password}\n${prepared.channel}", timeoutSeconds = 30,
+            )
+            check(reuseRc == 0) { "Hotspot reuse preparation failed rc=$reuseRc: ${reuseOut.take(200)}" }
+            val active = parseHotspotMetadata(reuseOut)
+            check(active.ownedActive) { "Helper did not confirm its owned hotspot is ready" }
+            val existing = findEndpoint(emptyList(), active.iface, active.address)
                 ?: throw IllegalStateException("Owned hotspot interface/address unavailable")
             hotspotStartedByUs = false
             raiseRmemMax()
-            cacheHotspotProfile(prepared)
+            cacheHotspotProfile(active)
             log("Network mode=$networkMode interface=${existing.first.name} already up")
             return Endpoint(
-                prepared.ssid, prepared.password, prepared.channel, existing.first, existing.second,
+                active.ssid, active.password, active.channel, existing.first, existing.second,
                 hotspotAddresses(existing.first, existing.second),
             )
         }
