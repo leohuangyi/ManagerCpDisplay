@@ -20,7 +20,7 @@ import com.shilapi.xcertplay.adb.LocalAdb
  * Brings up the wireless link for CarPlay:
  *
  *  - `auto`: start the hotspot natively over root (hostapd -> static IP -> dnsmasq), since the
- *    miwifi firmware's `setWifiApEnabled` never launches hostapd; reuses it when already up.
+ *    miwifi firmware's `setWifiApEnabled` never launches hostapd; rebuilds it on every start.
  *  - `direct`: Wi-Fi Direct Group Owner via [WifiP2pManager.createGroup] (needs P2P-capable firmware).
  */
 class LegacyNetwork(
@@ -130,36 +130,21 @@ class LegacyNetwork(
         val (prepRc, prepOut) = runOp(OP_HOTSPOT_PREP, timeoutSeconds = 12)
         check(prepRc == 0) { "Hotspot preparation failed rc=$prepRc: ${prepOut.take(200)}" }
         val prepared = parseHotspotMetadata(prepOut)
-        if (prepared.ownedActive) {
-            // AP processes and an address do not prove that discovery is ready. An OEM
-            // media reset can restart mdnsd while this owned AP survives, taking UDP 5353
-            // away from JmDNS. n1 preserves a healthy AP, or rebuilds our resources if
-            // OEM STA took the radio, without transferring teardown ownership here.
-            val (reuseRc, reuseOut) = runOp(
-                OP_HOTSPOT_UP, "${prepared.ssid}\n${prepared.password}\n${prepared.channel}", timeoutSeconds = 30,
-            )
-            check(reuseRc == 0) { "Hotspot reuse preparation failed rc=$reuseRc: ${reuseOut.take(200)}" }
-            val active = parseHotspotMetadata(reuseOut)
-            check(active.ownedActive) { "Helper did not confirm its owned hotspot is ready" }
-            val existing = findEndpoint(emptyList(), active.iface, active.address)
-                ?: throw IllegalStateException("Owned hotspot interface/address unavailable")
-            hotspotStartedByUs = false
-            raiseRmemMax()
-            cacheHotspotProfile(active)
-            log("Network mode=$networkMode interface=${existing.first.name} already up")
-            return Endpoint(
-                active.ssid, active.password, active.channel, existing.first, existing.second,
-                hotspotAddresses(existing.first, existing.second),
-            )
-        }
-
         // Preserve this app's saved credentials when upgrading the helper. The runtime
         // validates them and keeps its own copy after a successful start.
         val requested = cachedHotspotProfile(prepared)
+        if (stopped()) throw InterruptedException("Hotspot preparation stopped")
+        // Remove only the helper's owned resources before OEM recovery and a fresh start.
+        // Cleanup failure must retain the journal and stop this attempt, not reuse the AP.
+        val (downRc, downOut) = runOp(OP_HOTSPOT_DOWN, timeoutSeconds = 20)
+        log("Hotspot cleanup rc=$downRc")
+        check(downRc == 0) { "Hotspot cleanup failed rc=$downRc: ${downOut.take(200)}" }
+        if (stopped()) throw InterruptedException("Hotspot preparation stopped")
         // This is optional OEM recovery: an absent mcreset must not prevent an otherwise
         // capable head unit from starting its AP. WIAP policy is managed by the host.
         val (mcRc, mcOut) = runOp(OP_MC_RESET, timeoutSeconds = 15)
         log("McReset before hotspot rc=$mcRc out=${mcOut.trim().take(200)}")
+        if (stopped()) throw InterruptedException("Hotspot preparation stopped")
 
         val (upRc, upOut) = runOp(
             OP_HOTSPOT_UP, "${requested.ssid}\n${requested.password}\n${requested.channel}", timeoutSeconds = 30,
@@ -167,9 +152,10 @@ class LegacyNetwork(
         // Successful metadata includes credentials, so keep it out of diagnostics.
         log("Hotspot up rc=$upRc")
         check(upRc == 0) { "Hotspot startup failed rc=$upRc: ${upOut.take(200)}" }
+        hotspotStartedByUs = true
+        if (stopped()) throw InterruptedException("Hotspot preparation stopped")
         val active = parseHotspotMetadata(upOut)
         check(active.ownedActive) { "Helper did not confirm its owned hotspot is ready" }
-        hotspotStartedByUs = true
 
         val (iface, address) = findEndpoint(emptyList(), active.iface, active.address)
             ?: throw IllegalStateException("Network IPv4 address unavailable")
@@ -288,19 +274,6 @@ class LegacyNetwork(
     }
 
     /**
-     * Raises the kernel receive-buffer ceiling to 2 MB. The miwifi kernel boots with
-     * net.core.rmem_max=131071, which silently caps SO_RCVBUF at ~256 KB no matter what the
-     * app requests, and the TCP window scale negotiated at SYN time is derived from that
-     * capped buffer. Without this, the screen stream's 2 MB receive window never takes
-     * effect and Wi-Fi bursts still stall reads. tcp_rmem's ceiling is already 2097152.
-     * Best effort: any su failure is logged and the connection still works with the cap.
-     */
-    private fun raiseRmemMax() {
-        val (rc, out) = runOp(OP_RMEM, timeoutSeconds = 5)
-        if (rc != 0) log("rmem_max raise failed rc=$rc out=${out.trim().take(120)}")
-    }
-
-    /**
      * Runs a privileged command through the assistant app's opcode channel. This app only
      * sends an opaque [op] token plus optional newline-joined [args]; the real shell script
      * lives in the assistant's CpManager, so decompiling this APK does not reveal the hotspot
@@ -370,6 +343,7 @@ class LegacyNetwork(
             .invoke(wifi, config, enabled) == true
 
     override fun close() {
+        // Every successful auto preparation owns the freshly rebuilt hotspot.
         if (hotspotStartedByUs) {
             runOp(OP_HOTSPOT_DOWN)
         }
@@ -402,8 +376,8 @@ class LegacyNetwork(
 
     /**
      * Restores the head unit's client Wi-Fi after CarPlay ended and the app exits for good
-     * (final app exit, not an in-process wireless restart). The helper also owns a hotspot
-     * reused on the fast path, and restores only the changes in its durable journal. OEM
+     * (final app exit, not an in-process wireless restart). The helper restores only the
+     * changes in its durable journal, including an earlier interrupted preparation. OEM
      * hotspots and a Wi-Fi station that was originally disabled are left alone.
      */
     fun restoreAfterCarPlay(): Boolean {
@@ -419,12 +393,11 @@ class LegacyNetwork(
         const val AP_STATE_ENABLED = 13
 
         // Opaque opcodes the assistant app's CpManager maps back to the real hotspot scripts.
-        // This APK keeps only these tokens; the actual hostapd/dnsmasq/rmem/wifi-restore shell
+        // This APK keeps only these tokens; the actual hostapd/dnsmasq/wifi-restore shell
         // text lives in the assistant process to keep decompilation from revealing the wiring.
         const val OP_HOTSPOT_PREP = "n0"
         const val OP_HOTSPOT_UP = "n1"
         const val OP_HOTSPOT_DOWN = "n2"
-        const val OP_RMEM = "n3"
         const val OP_WIFI_RESTORE = "n4"
         const val OP_MC_RESET = "n5"
     }
