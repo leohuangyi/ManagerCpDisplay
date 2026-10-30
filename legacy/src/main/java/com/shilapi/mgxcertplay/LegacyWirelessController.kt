@@ -24,6 +24,7 @@ import com.shilapi.xcertplay.iap2.session.Iap2Session
 import com.shilapi.xcertplay.mfi.Iap2MfiAuthenticationClient
 import com.shilapi.xcertplay.mfi.LocalMfiAuthenticationClient
 import com.shilapi.xcertplay.network.CarPlayBonjourProtocol
+import com.shilapi.xcertplay.network.WirelessReceiveDiagnostics
 import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
 import com.shilapi.xcertplay.transport.BluetoothRfcommDuplexStream
 import com.shilapi.xcertplay.transport.BluetoothControlSocketOwner
@@ -34,12 +35,14 @@ import com.shilapi.xcertplay.transport.Iap2WirelessControlResult
 import com.shilapi.xcertplay.transport.Iap2WirelessIdentification
 import com.shilapi.xcertplay.transport.Iap2WirelessSecurity
 import com.shilapi.xcertplay.transport.WirelessBootstrapRecoveryPolicy
+import com.shilapi.xcertplay.transport.WirelessBootstrapEndpointRecovery
 import java.io.BufferedReader
 import java.io.Closeable
 import java.io.IOException
 import java.io.InputStreamReader
 import java.net.Inet4Address
 import java.net.Inet6Address
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
@@ -51,6 +54,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import javax.jmdns.JmDNS
 import javax.jmdns.ServiceEvent
 import javax.jmdns.ServiceInfo
@@ -419,7 +423,7 @@ class LegacyWirelessController(
                 includeLegacyConnectionMessages = false,
             ),
         )
-        val wirelessEndpoint = Iap2WirelessCarPlayEndpoint(
+        val wirelessEndpoint = AtomicReference(Iap2WirelessCarPlayEndpoint(
             ssid = readyEndpoint.ssid,
             passphrase = readyEndpoint.password,
             channel = readyEndpoint.channel,
@@ -434,7 +438,7 @@ class LegacyWirelessController(
             // 0x4301 calls this field PublicKey, but it carries the pairing identity (Bonjour pi).
             publicKey = setup.identity.pairingId,
             sourceVersion = setup.config.sourceVersion,
-        )
+        ))
 
         setup.media.setIapTunnelHandler { stream: BlockingDuplexByteStream ->
             val accepted = synchronized(bluetoothControlLock) {
@@ -454,7 +458,7 @@ class LegacyWirelessController(
                         log("Wi-Fi iAP2 tunnel established")
                         val result = Iap2WirelessControlClient(session, setup.mfiClient).run(
                             identification = identification,
-                            endpoint = wirelessEndpoint,
+                            endpoint = wirelessEndpoint.get(),
                             onReady = { log("Wi-Fi iAP2 authenticated; control tunnel ready") },
                             keepAliveAfterDeadline = { !closed.get() && activeSession != null },
                             onProgress = { log("Wi-Fi: $it") },
@@ -530,14 +534,14 @@ class LegacyWirelessController(
 
         prepareBluetoothServices()
         log("listening on ${readyEndpoint.iface.name}; starting Bluetooth handshake")
-        runBluetoothBootstrap(phone, setup.mfiClient, identification, wirelessEndpoint)
+        runBluetoothBootstrap(phone, setup.mfiClient, identification, wirelessEndpoint, readyEndpoint)
         // Outbound connection retries remain bounded. A later authenticated phone-initiated
         // connection is a new event and can still use the prepared Wi-Fi/iAP2 engine.
         while (!closed.get() && !hasWirelessHandoff()) {
             if (!bluetoothSocketOwner.awaitIncoming()) return
             if (closed.get() || hasWirelessHandoff()) return
             val result = runBluetoothControlAttempt(
-                phone, setup.mfiClient, identification, wirelessEndpoint,
+                phone, setup.mfiClient, identification, wirelessEndpoint.get(),
                 recovering = true, incomingOnly = true,
             )
             if (result != null) logControlResult("Bluetooth incoming", result)
@@ -936,8 +940,10 @@ class LegacyWirelessController(
         phone: BluetoothDevice,
         mfiClient: Iap2MfiAuthenticationClient,
         identification: Iap2IdentificationConfig,
-        endpoint: Iap2WirelessCarPlayEndpoint,
+        endpoint: AtomicReference<Iap2WirelessCarPlayEndpoint>,
+        networkEndpoint: LegacyNetwork.Endpoint,
     ) {
+        val receive = WirelessReceiveDiagnostics(networkEndpoint.iface.name)
         for (controlAttempt in 1..WirelessBootstrapRecoveryPolicy.MAX_ATTEMPTS) {
             if (closed.get()) return
             if (controlAttempt > 1 && hasWirelessHandoff()) {
@@ -945,9 +951,18 @@ class LegacyWirelessController(
                 return
             }
             log("Bluetooth control attempt $controlAttempt/${WirelessBootstrapRecoveryPolicy.MAX_ATTEMPTS}")
-            val result = runBluetoothControlAttempt(
-                phone, mfiClient, identification, endpoint, recovering = controlAttempt > 1,
-            ) ?: return
+            val currentEndpoint = endpoint.get()
+            val family = if (currentEndpoint.ipAddresses.all { ':' in it }) "IPv6" else "IPv4"
+            log("Bluetooth endpoint family=$family addressCount=${currentEndpoint.ipAddresses.size} " +
+                "port=${currentEndpoint.airPlayPort}")
+            receive.snapshot().lineSequence().forEach { log("Bluetooth attempt $controlAttempt before $it") }
+            val result = try {
+                runBluetoothControlAttempt(
+                    phone, mfiClient, identification, currentEndpoint, recovering = controlAttempt > 1,
+                )
+            } finally {
+                receive.snapshot().lineSequence().forEach { log("Bluetooth attempt $controlAttempt after $it") }
+            } ?: return
             logControlResult("Bluetooth attempt $controlAttempt", result)
             val decision = WirelessBootstrapRecoveryPolicy.afterControlEnded(
                 completedAttempts = controlAttempt,
@@ -976,10 +991,28 @@ class LegacyWirelessController(
                     log("Bluetooth ${result.terminal} at ${result.stage}; " +
                         "retrying control in ${decision.retryDelayMillis}ms with hotspot and listeners preserved")
                     if (!waitForBluetoothRetry(decision.retryDelayMillis)) return
+                    val nextEndpoint = WirelessBootstrapEndpointRecovery.afterTimeout(
+                        currentEndpoint, result, liveListeningAddresses(networkEndpoint),
+                    )
+                    if (closed.get() || hasWirelessHandoff()) return
+                    if (nextEndpoint !== currentEndpoint) {
+                        endpoint.set(nextEndpoint)
+                        val nextFamily = if (nextEndpoint.ipAddresses.all { ':' in it }) "IPv6" else "IPv4"
+                        log("Bluetooth endpoint family fallback from=$family next=$nextFamily")
+                    }
                 }
             }
         }
     }
+
+    /** Never advertise a late/unbound address or a different interface on a Bluetooth retry. */
+    private fun liveListeningAddresses(endpoint: LegacyNetwork.Endpoint): List<InetAddress> = runCatching {
+        val current = NetworkInterface.getByName(endpoint.iface.name)
+            ?: return@runCatching emptyList<InetAddress>()
+        if (!current.isUp) return@runCatching emptyList<InetAddress>()
+        val live = current.inetAddresses.toList()
+        endpoint.addresses.filter { it in live }
+    }.getOrDefault(emptyList())
 
     private fun hasAirPlayConnection(): Boolean =
         activeSession != null || acceptingAirPlay.get() > 0 || sessions.isNotEmpty()

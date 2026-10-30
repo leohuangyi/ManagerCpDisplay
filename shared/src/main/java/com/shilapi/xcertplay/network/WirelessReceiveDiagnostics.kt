@@ -8,7 +8,7 @@ import java.io.IOException
  * Android/OEM policy may hide these files; an inaccessible source is tried only once per run.
  * UDP counters cover the device network namespace, not a particular interface, app or RTP stream.
  */
-internal class WirelessReceiveDiagnostics(
+class WirelessReceiveDiagnostics(
     interfaceName: String?,
     private val read: (String, Int) -> String = ::readBoundedDiagnosticFile,
     private val nowNs: () -> Long = System::nanoTime,
