@@ -28,6 +28,7 @@ import com.shilapi.xcertplay.network.WirelessReceiveDiagnostics
 import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
 import com.shilapi.xcertplay.transport.BluetoothRfcommDuplexStream
 import com.shilapi.xcertplay.transport.BluetoothControlSocketOwner
+import com.shilapi.xcertplay.transport.BluetoothLocalName
 import com.shilapi.xcertplay.transport.Iap2IdentificationConfig
 import com.shilapi.xcertplay.transport.Iap2WirelessCarPlayEndpoint
 import com.shilapi.xcertplay.transport.Iap2WirelessControlClient
@@ -80,6 +81,7 @@ class LegacyWirelessController(
 
     companion object {
         private const val TAG = "LegacyWireless"
+        private const val RECEIVER_NAME = "HondaHFT"
         private const val RFCOMM_UUID = "00000000-deca-fade-deca-deafdecacafe"
         private const val ACCESSORY_RFCOMM_UUID = "00000000-deca-fade-deca-deafdecacaff"
         private const val CARPLAY_SERVICE_UUID = "ec884348-cd41-40a2-9727-575d50bf1fd3"
@@ -348,10 +350,6 @@ class LegacyWirelessController(
         wifiLocks += wifiLock
 
         val btMac = adapter.address ?: throw IllegalStateException("unable to read Bluetooth address")
-        // iAP2 over Bluetooth must identify with the same name as the radio's EIR Local Name.
-        // AirPlay Info still uses its protocol-required "CarPlay" name independently.
-        val btName = adapter.name?.takeIf { it.isNotBlank() }
-            ?: throw IllegalStateException("unable to read Bluetooth local name")
 
         // A cold start used to run its stages back to back; now only the hotspot bring-up (the
         // long pole) and MFi/media session setup run, in parallel and meeting at a latch. HFP is
@@ -406,7 +404,7 @@ class LegacyWirelessController(
         )
 
         val identification = Iap2IdentificationConfig(
-            name = btName,
+            name = RECEIVER_NAME,
             modelIdentifier = "CarPlay",
             manufacturer = "CarPlay",
             serialNumber = setup.identity.pairingId,
@@ -554,12 +552,23 @@ class LegacyWirelessController(
      * worker may consume them and run identification/authentication.
      */
     fun prepareBluetoothServices() = synchronized(bluetoothServicePreparationLock) {
-        if (bluetoothServicesPrepared || closed.get()) return@synchronized
+        if (closed.get()) return@synchronized
         val adapter = BluetoothAdapter.getDefaultAdapter()
             ?: throw IllegalStateException("Android Bluetooth is unavailable")
         check(adapter.isEnabled) { "please enable Bluetooth first" }
-        val name = adapter.name?.takeIf { it.isNotBlank() }
-            ?: throw IllegalStateException("unable to read Bluetooth local name")
+        // setName is asynchronous. Verify the radio's EIR name before publishing iAP2, and
+        // recheck on the post-hotspot call even when these services are already prepared.
+        if (BluetoothLocalName.ensure(
+                expected = RECEIVER_NAME,
+                currentName = { adapter.name },
+                requestName = { adapter.setName(it) },
+                enabled = { adapter.isEnabled },
+                cancelled = { closed.get() },
+            )) {
+            log("Bluetooth local name synchronized with iAP2/AirPlay")
+        }
+        if (bluetoothServicesPrepared || closed.get()) return@synchronized
+        val name = RECEIVER_NAME
         val added = ArrayList<Closeable>()
         try {
             for ((label, uuid) in listOf(
@@ -667,7 +676,7 @@ class LegacyWirelessController(
         val deviceId = deviceId(null)
 
         val config = AirPlayConfig(
-            deviceName = "CarPlay",
+            deviceName = RECEIVER_NAME,
             deviceId = deviceId,
             btMac = btMac,
             sourceVersion = SOURCE_VERSION,
@@ -982,7 +991,7 @@ class LegacyWirelessController(
                     if (!closed.get() && !hasWirelessHandoff()) {
                         failure("Bluetooth bootstrap", IOException(
                             "${result.terminal} at ${result.stage} after $controlAttempt attempts; " +
-                                "iPhone has not opened a Wi-Fi CarPlay connection",
+                                "请确保iPhone设置->通用->CarPlay车载->我的车 只保留HondaHFT，其他点忽略这辆车",
                         ))
                     }
                     return
